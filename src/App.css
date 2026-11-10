@@ -2425,6 +2425,28 @@ tbody tr:last-child td {
   padding: 28px 32px;
 }
 
+.staff-login-page {
+  display: flex;
+  min-height: 100vh;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  padding: 24px;
+  background: var(--paper);
+}
+
+.staff-login-back {
+  width: min(100%, 420px);
+  color: #69775e;
+  font-size: 11px;
+  text-decoration: none;
+}
+
+.staff-login-page .modal {
+  max-height: calc(100vh - 80px);
+}
+
 .login-brand {
   display: flex;
   align-items: center;

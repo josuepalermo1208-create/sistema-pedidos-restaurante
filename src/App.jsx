@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  STORAGE_KEY,
   dateKey,
   loadData,
   money,
+  normalizeSales,
   tableOrders,
   tableStatus,
   tableTotal,
@@ -65,6 +65,23 @@ const demoAccounts = [
 const categories = ['Entradas', 'Platillos', 'Bebidas', 'Postres']
 const fallbackFoodImage = `data:image/svg+xml;charset=UTF-8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 400"><rect width="600" height="400" fill="#e8e8df"/><circle cx="300" cy="200" r="122" fill="#f8f7f0"/><circle cx="300" cy="200" r="92" fill="#d8dfce"/><circle cx="300" cy="200" r="59" fill="#a6b293"/><path d="M210 205c30-54 68-50 93-8 28-41 70-31 87 8-39 57-130 68-180 0Z" fill="#70805e"/><circle cx="273" cy="177" r="9" fill="#c07b50"/><circle cx="332" cy="222" r="8" fill="#c07b50"/><text x="300" y="355" text-anchor="middle" fill="#6e7964" font-family="Arial,sans-serif" font-size="19" letter-spacing="5">LUMBRE</text></svg>')}`
 
+const handleLogout = () => {
+  fetch('http://localhost:8080/SistemaPedidosBackend/api/auth/logout', {
+    method: 'POST',
+    credentials: 'include' // 🔴 Crucial para que Tomcat reconozca la sesión a destruir
+  })
+  .then(res => {
+    if (!res.ok) throw new Error('Error al cerrar sesión');
+    return res.json();
+  })
+  .then(() => {
+    // Limpiamos el estado del usuario logueado en React
+    setUser(null);
+    setSection('login');
+  })
+  .catch(err => console.error(err));
+};
+
 function handleImageError(event) {
   if (event.currentTarget.dataset.fallback) return
   event.currentTarget.dataset.fallback = 'true'
@@ -81,13 +98,15 @@ function longDate(value = new Date()) {
 
 function App() {
   const [data, setData] = useState(loadData)
+  const [kitchenOrders, setKitchenOrders] = useState([])
   const [session, setSession] = useState(null)
+  const [pathname, setPathname] = useState(() => window.location.pathname.replace(/\/+$/, '') || '/')
   const [section, setSection] = useState('menu')
   const [tableId, setTableId] = useState('4')
   const [category, setCategory] = useState('Todos')
   const [cart, setCart] = useState({})
   const [toast, setToast] = useState(null)
-  const [loginOpen, setLoginOpen] = useState(false)
+  const [tableChangeRequest, setTableChangeRequest] = useState(null)
   const [modal, setModal] = useState(null)
   const [payment, setPayment] = useState(null)
   const [paymentMethod, setPaymentMethod] = useState('Efectivo')
@@ -96,51 +115,132 @@ function App() {
   const [reportEnd, setReportEnd] = useState(todayKey())
   const [saleDate, setSaleDate] = useState(todayKey())
   const [logType, setLogType] = useState('Todos')
-  const fileInput = useRef(null)+
+  const fileInput = useRef(null)
 
   useEffect(() => {
-    // Asegúrate de que el puerto (8080) y el nombre del proyecto (LumbreBackend) coincidan con los de tu Tomcat
-    fetch('http://localhost:8080/LumbreBackend/api/menu')
-      .then((response) => {
-        if (!response.ok) throw new Error('Error al conectar con el servidor');
-        return response.json();
-      })
-      .then((menuData) => {
-        console.log('Menú cargado desde MySQL:', menuData);
-        
-        // Actualizamos el estado global reemplazando los productos locales por los de la BD
+    const syncPathname = () => setPathname(window.location.pathname.replace(/\/+$/, '') || '/')
+    window.addEventListener('popstate', syncPathname)
+    return () => window.removeEventListener('popstate', syncPathname)
+  }, [])
+
+  const navigate = (path) => {
+    window.history.pushState({}, '', path)
+    setPathname(path)
+  }
+
+  const loadApiUsers = useCallback(async () => {
+    const response = await fetch('http://localhost:8080/SistemaPedidosBackend/api/usuarios', {
+      credentials: 'include',
+    })
+    if (!response.ok) throw new Error('No fue posible consultar los usuarios')
+    const users = await response.json()
+    const apiUsers = Array.isArray(users) ? users : []
+    setData((currentData) => ({ ...currentData, users: apiUsers }))
+    return apiUsers
+  }, [])
+
+  const loadApiTables = useCallback(async () => {
+    const response = await fetch('http://localhost:8080/SistemaPedidosBackend/api/mesas', {
+      credentials: 'include',
+    })
+    if (!response.ok) throw new Error('No fue posible consultar las mesas')
+    const tables = await response.json()
+    const apiTables = Array.isArray(tables) ? tables : []
+    setData((currentData) => ({ ...currentData, tables: apiTables }))
+    return apiTables
+  }, [])
+
+  const loadApiMenu = useCallback(async () => {
+    const response = await fetch('http://localhost:8080/SistemaPedidosBackend/api/menu', {
+      credentials: 'include',
+    })
+    if (!response.ok) throw new Error('No fue posible consultar el menú')
+    const menu = await response.json()
+    const apiProducts = Array.isArray(menu) ? menu : (menu.value || menu.products || [])
+    setData((currentData) => ({ ...currentData, products: apiProducts }))
+    return apiProducts
+  }, [])
+
+  const loadApiSales = useCallback(async () => {
+    const response = await fetch('http://localhost:8080/SistemaPedidosBackend/api/ventas', {
+      credentials: 'include',
+    })
+    if (!response.ok) throw new Error('No fue posible consultar las ventas')
+    const sales = await response.json()
+    const rawSales = Array.isArray(sales) ? sales : (sales.value || sales.ventas || [])
+    const apiSales = normalizeSales(rawSales)
+    setData((currentData) => ({ ...currentData, sales: apiSales }))
+    return apiSales
+  }, [])
+
+  const loadApiOrders = useCallback(async (filters = {}) => {
+    const params = new URLSearchParams()
+    if (filters.area) params.set('area', filters.area)
+    if (filters.estado) params.set('estado', filters.estado)
+    if (filters.mesaId) params.set('mesaId', filters.mesaId)
+    const url = `http://localhost:8080/SistemaPedidosBackend/api/pedidos${params.size ? `?${params}` : ''}`
+    const response = await fetch(url, { credentials: 'include' })
+    if (!response.ok) throw new Error('No fue posible consultar los pedidos')
+    const orders = await response.json()
+    const apiOrders = Array.isArray(orders) ? orders : []
+    const filteredOrders = apiOrders.filter((order) => (
+      (!filters.area || order.area === filters.area)
+      && (!filters.estado || order.status === filters.estado || order.estado === filters.estado)
+      && (!filters.mesaId || String(order.tableId) === String(filters.mesaId))
+    ))
+    setData((currentData) => ({ ...currentData, orders: filteredOrders }))
+    return apiOrders
+  }, [])
+
+  useEffect(() => {
+    loadApiUsers().catch((error) => console.error('Error obteniendo los usuarios:', error))
+  }, [loadApiUsers])
+
+  useEffect(() => {
+    loadApiTables().catch((error) => console.error('Error obteniendo las mesas:', error))
+    loadApiOrders().catch((error) => console.error('Error obteniendo los pedidos:', error))
+    loadApiSales().catch((error) => console.error('Error obteniendo las ventas:', error))
+  }, [loadApiTables, loadApiOrders, loadApiSales])
+
+  useEffect(() => {
+    fetch(`http://localhost:8080/SistemaPedidosBackend/api/mesas/${encodeURIComponent(tableId)}/cuenta`, {
+      credentials: 'include',
+    })
+      .then((response) => response.ok ? response.json() : null)
+      .then((account) => {
+        if (!account) return
         setData((currentData) => ({
           ...currentData,
-          products: menuData
-        }));
+          accounts: { ...currentData.accounts, [tableId]: { ...currentData.accounts[tableId], ...account } },
+        }))
       })
-      .catch((error) => {
-        console.error('Error obteniendo el menú:', error);
-        // Opcional: podrías usar tu función notify() aquí si falla la conexión
-      });
-  }, []);
+      .catch((error) => console.error('Error obteniendo la cuenta de mesa:', error))
+  }, [tableId])
 
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
-    } catch (error) {
-      console.error('No fue posible guardar los cambios en este navegador.', error)
-    }
-  }, [data])
+    fetch('http://localhost:8080/SistemaPedidosBackend/api/auth/session', {
+      credentials: 'include',
+    })
+      .then(async (response) => {
+        if (!response.ok) return null
+        const sessionData = await response.json()
+        if (!sessionData.user) return null
+        const users = await loadApiUsers()
+        const apiUser = users.find((candidate) => candidate.id === sessionData.user.id)
+        return apiUser ? { ...sessionData.user, ...apiUser } : sessionData.user
+      })
+      .then((currentSession) => {
+        if (!currentSession) return
+        setSession(currentSession)
+        setSection('overview')
+      })
+      .catch((error) => console.error('Error comprobando la sesión:', error))
+  }, [loadApiUsers])
 
   useEffect(() => {
-    const onStorage = (event) => {
-      if (event.key === STORAGE_KEY && event.newValue) {
-        try {
-          setData(JSON.parse(event.newValue))
-        } catch (error) {
-          console.error('No fue posible sincronizar los cambios de otra pestaña.', error)
-        }
-      }
-    }
-    window.addEventListener('storage', onStorage)
-    return () => window.removeEventListener('storage', onStorage)
-  }, [])
+    // Asegúrate de que el puerto (8080) y el nombre del proyecto (SistemaPedidosBackend) coincidan con los de tu Tomcat
+    loadApiMenu().catch((error) => console.error('Error obteniendo el menú:', error));
+  }, [loadApiMenu]);
 
   useEffect(() => {
     if (!toast) return undefined
@@ -151,36 +251,127 @@ function App() {
   const notify = useCallback((message, type = 'success') => setToast({ message, type }), [])
   const actor = session?.name || 'Comensal'
 
+  const loadKitchenOrders = useCallback(async () => {
+    try {
+      const response = await fetch(`http://localhost:8080/SistemaPedidosBackend/api/pedidos?area=${encodeURIComponent(session?.area || '')}`, { credentials: 'include' })
+      if (!response.ok) throw new Error('No fue posible consultar los pedidos de cocina')
+      const orders = await response.json()
+      const pendingOrders = Array.isArray(orders) ? orders : (orders.value || orders.pedidos || [])
+      setKitchenOrders(pendingOrders.filter((order) =>
+        !order.paid
+        && (order.status === 'Pendiente' || order.status === 'En preparación')
+        && (!order.area || order.area === session?.area)
+      ))
+    } catch (error) {
+      console.error('Error obteniendo los pedidos de cocina:', error)
+    }
+  }, [session?.area])
+
+  const updateKitchenOrder = async (orderId, status) => {
+    try {
+      const response = await fetch(`http://localhost:8080/SistemaPedidosBackend/api/pedidos/${encodeURIComponent(orderId)}/estado`, {
+        method: 'PATCH',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ estado: status }),
+      })
+      if (!response.ok) throw new Error('No fue posible actualizar el pedido')
+      await loadKitchenOrders()
+      notify(status === 'Listo' ? 'Pedido listo. Servicio ya puede entregarlo.' : 'Pedido en preparación.')
+    } catch (error) {
+      console.error('Error actualizando el pedido de cocina:', error)
+      notify('No se pudo actualizar el pedido.', 'error')
+    }
+  }
+
+  useEffect(() => {
+    if (session?.role !== 'cocinero') return undefined
+    loadKitchenOrders()
+    const interval = window.setInterval(loadKitchenOrders, 5000)
+    return () => window.clearInterval(interval)
+  }, [session?.role, loadKitchenOrders])
+
   const changeData = (mutate, type, description) => {
     setData((current) => withEvent(mutate(current), type, actor, description))
   }
 
-  const login = (event, credentials) => {
+  const login = async (event, credentials) => {
     event.preventDefault()
-    const username = credentials.username.trim().toLowerCase()
-    const user = data.users.find((candidate) => candidate.username.toLowerCase() === username && candidate.role === credentials.role)
-    if (!username || !credentials.password) {
+    if (!credentials.username.trim() || !credentials.password) {
       notify('Completa todos los campos.', 'error')
       return
     }
-    if (!user || !user.active || user.password !== credentials.password) {
-      setData((current) => withEvent(current, 'Acceso', username, 'Intento fallido de inicio de sesión.'))
-      notify('Usuario o contraseña incorrectos.', 'error')
-      return
+    try {
+      const response = await fetch('http://localhost:8080/SistemaPedidosBackend/api/auth/login', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(credentials),
+      })
+      if (!response.ok) throw new Error('Usuario o contraseña incorrectos.')
+      const loginData = await response.json()
+      const users = await loadApiUsers()
+      const user = users.find((candidate) => candidate.id === loginData.user?.id) || loginData.user
+      setSession(user)
+      setSection('overview')
+      notify(`Bienvenido/a, ${user.name}.`)
+      setData((current) => withEvent(current, 'Acceso', user.name, 'Inicio de sesión exitoso.'))
+    } catch (error) {
+      notify(error.message || 'No fue posible iniciar sesión.', 'error')
     }
-    setSession(user)
-    setSection('overview')
-    setLoginOpen(false)
-    notify(`Bienvenido/a, ${user.name}.`)
-    setData((current) => withEvent(current, 'Acceso', user.name, 'Inicio de sesión exitoso.'))
   }
 
-  const logout = () => {
+  const logout = async () => {
+    try {
+      await fetch('http://localhost:8080/SistemaPedidosBackend/api/auth/logout', {
+        method: 'POST',
+        credentials: 'include',
+      })
+    } catch (error) {
+      console.error('Error cerrando la sesión:', error)
+    }
     setData((current) => withEvent(current, 'Acceso', actor, 'Cierre de sesión.'))
     setSession(null)
     setSection('menu')
     setCart({})
+    navigate('/personal')
     notify('Sesión cerrada correctamente.')
+  }
+
+  const authorizeTableChange = async (credentials) => {
+    const username = credentials.username.trim().toLowerCase()
+    const staffUser = data.users.find((user) => user.active !== false && user.username?.toLowerCase() === username)
+    if (!staffUser) {
+      notify('El usuario no pertenece al personal activo.', 'error')
+      return
+    }
+    if (!['gerente', 'mesero'].includes(staffUser.role)) {
+      notify('Solo un gerente o mesero puede autorizar el cambio de mesa.', 'error')
+      return
+    }
+    try {
+      const response = await fetch('http://localhost:8080/SistemaPedidosBackend/api/auth/login', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password: credentials.password, role: staffUser.role }),
+      })
+      if (!response.ok) throw new Error('Usuario o contraseña incorrectos.')
+      setTableId(tableChangeRequest)
+      setTableChangeRequest(null)
+      notify(`Mesa cambiada al número ${tableChangeRequest}.`)
+    } catch (error) {
+      notify(error.message || 'No fue posible autorizar el cambio de mesa.', 'error')
+    } finally {
+      try {
+        await fetch('http://localhost:8080/SistemaPedidosBackend/api/auth/logout', {
+          method: 'POST',
+          credentials: 'include',
+        })
+      } catch (error) {
+        console.error('Error cerrando la autorización temporal:', error)
+      }
+    }
   }
 
   const addToCart = (product) => {
@@ -208,26 +399,30 @@ function App() {
     })
   }
 
-  const sendOrder = () => {
+  const sendOrder = async () => {
     const items = Object.values(cart)
       .map((cartItem) => {
         const product = data.products.find((candidate) => candidate.id === cartItem.productId && candidate.active)
         return product ? { ...cartItem, name: product.name, price: Number(product.price), area: product.area } : null
       })
       .filter(Boolean)
+
     if (!items.length) {
       notify('Agrega al menos un producto.', 'error')
       return
     }
+
     if (data.accounts[tableId]?.requested) {
       notify('Tu cuenta ya fue solicitada. Pide apoyo al personal para agregar algo más.', 'error')
       return
     }
+
     const createdAt = new Date().toISOString()
     const grouped = Object.groupBy ? Object.groupBy(items, (item) => item.area) : items.reduce((groups, item) => {
       groups[item.area] = [...(groups[item.area] || []), item]
       return groups
     }, {})
+
     const newOrders = Object.entries(grouped).map(([area, orderItems]) => ({
       id: `PED-${Date.now().toString().slice(-6)}-${area === 'barra' ? 'B' : 'C'}`,
       tableId,
@@ -237,29 +432,79 @@ function App() {
       createdAt,
       paid: false,
     }))
-    changeData((current) => ({
-      ...current,
-      orders: [...current.orders, ...newOrders],
-      accounts: { ...current.accounts, [tableId]: { ...current.accounts[tableId], requested: false } },
-    }), 'Pedido', `Nuevo pedido de la mesa ${tableId.padStart(2, '0')}.`)
+
+    const sentOrders = []
+    let sendError = null
+    for (const order of newOrders) {
+      try {
+        const response = await fetch('http://localhost:8080/SistemaPedidosBackend/api/pedidos', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify(order),
+        })
+        const responseBody = await response.text()
+        if (!response.ok) {
+          throw new Error(responseBody || `La API respondió HTTP ${response.status}`)
+        }
+        sentOrders.push(order)
+      } catch (error) {
+        sendError = error
+        break
+      }
+    }
+
+    if (sentOrders.length) {
+      const sentProductIds = new Set(sentOrders.flatMap((order) => order.items.map((item) => item.productId)))
+      changeData((current) => ({
+        ...current,
+        orders: [...current.orders, ...sentOrders],
+        accounts: { ...current.accounts, [tableId]: { ...current.accounts[tableId], requested: false } },
+      }), 'Pedido', `Nuevo pedido de la mesa ${tableId.padStart(2, '0')}.`)
+      setCart((current) => Object.fromEntries(Object.entries(current).filter(([productId]) => !sentProductIds.has(productId))))
+    }
+
+    if (sendError) {
+      console.error('Error al enviar el pedido:', sendError)
+      notify(
+        sentOrders.length
+          ? `Se enviaron ${sentOrders.length} de ${newOrders.length} comandas. El resto sigue en tu pedido; inténtalo nuevamente.`
+          : 'No se pudo enviar tu pedido, intenta nuevamente.',
+        'error',
+      )
+      if (sentOrders.length) setSection('order')
+      return
+    }
+
     setCart({})
     notify('Tu pedido se envió correctamente.')
     setSection('account')
   }
 
-  const requestAccount = (method) => {
+  const requestAccount = async (method) => {
     if (!tableOrders(data, tableId).length) {
       notify('No tienes pedidos para solicitar la cuenta.', 'error')
       return
     }
-    changeData((current) => ({
-      ...current,
-      accounts: {
-        ...current.accounts,
-        [tableId]: { requested: true, method, requestedAt: new Date().toISOString(), attendedBy: null },
-      },
-    }), 'Cuenta', `La mesa ${tableId.padStart(2, '0')} solicitó la cuenta (${method.toLowerCase()}).`)
-    notify('Tu cuenta fue solicitada, en un momento se acercará el personal.')
+    try {
+      const response = await fetch(`http://localhost:8080/SistemaPedidosBackend/api/mesas/${encodeURIComponent(tableId)}/solicitudes-cuenta`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ metodo: method, method, mesaId: tableId }),
+      })
+      if (!response.ok) throw new Error('No fue posible solicitar la cuenta')
+      changeData((current) => ({
+        ...current,
+        accounts: {
+          ...current.accounts,
+          [tableId]: { requested: true, method, requestedAt: new Date().toISOString(), attendedBy: null },
+        },
+      }), 'Cuenta', `La mesa ${tableId.padStart(2, '0')} solicitó la cuenta (${method.toLowerCase()}).`)
+      notify('Tu cuenta fue solicitada, en un momento se acercará el personal.')
+    } catch (error) {
+      notify(error.message, 'error')
+    }
   }
 
   const billTotal = tableTotal(data, tableId)
@@ -271,6 +516,15 @@ function App() {
 
   const currentNav = roleNavigation[session?.role] || []
   const displayName = session?.name || 'Invitado'
+
+  if (!session && pathname === '/personal') {
+    return (
+      <>
+        <LoginModal standalone onLogin={login} onClose={() => navigate('/')} />
+        {toast ? <div className={`toast-message toast-${toast.type}`} role="status" aria-live="polite"><span>{toast.type === 'error' ? '!' : '✓'}</span>{toast.message}<button onClick={() => setToast(null)} aria-label="Cerrar aviso">×</button></div> : null}
+      </>
+    )
+  }
 
   return (
     <div className={session ? 'app-layout staff-layout' : 'app-layout guest-layout'}>
@@ -311,17 +565,17 @@ function App() {
               </a>
               <div className="guest-top-actions">
                 <label className="table-picker"><span>MESA</span>
-                  <select value={tableId} onChange={(event) => setTableId(event.target.value)} aria-label="Seleccionar mesa">
+                  <select value={tableId} onChange={(event) => setTableChangeRequest(event.target.value)} aria-label="Seleccionar mesa">
                     {data.tables.filter((table) => table.active).map((table) => <option key={table.id} value={table.id}>{table.name}</option>)}
                   </select>
                 </label>
-                <button className="button button-quiet staff-login-button" onClick={() => setLoginOpen(true)}>Acceso de personal <span>↗</span></button>
+                {/* <a className="button button-quiet staff-login-button" href="/personal" onClick={(event) => { event.preventDefault(); navigate('/personal') }}>Acceso de personal <span>↗</span></a> */}
               </div>
             </>
           ) : (
             <>
               <div className="breadcrumb"><span>RESTAURANTE LUMBRE</span><span className="breadcrumb-divider">/</span><strong>{currentNav.find(([id]) => id === section)?.[1] || roles[session.role]?.title}</strong></div>
-              <div className="topbar-right"><span className="date-label">{longDate()}</span><button className="top-avatar" aria-label="Cerrar sesión" title="Cerrar sesión" onClick={logout}>{session.name.split(' ').map((part) => part[0]).slice(0, 2).join('')}</button></div>
+              <div className="topbar-right"><span className="date-label">{longDate()}</span><button className="top-avatar" aria-label="Cerrar sesión" title="Cerrar sesión" onClick={logout}>{displayName.split(' ').map((part) => part[0]).slice(0, 2).join('')}</button></div>
             </>
           )}
         </header>
@@ -368,14 +622,14 @@ function App() {
           ) : null}
           {session?.role === 'gerente' && section === 'overview' ? <ManagerOverview data={data} setSection={setSection} /> : null}
           {session?.role === 'gerente' && section === 'menu' ? <ManagerMenu data={data} changeData={changeData} notify={notify} setModal={setModal} /> : null}
-          {session?.role === 'gerente' && section === 'tables' ? <ManagerTables data={data} changeData={changeData} notify={notify} setModal={setModal} /> : null}
-          {session?.role === 'gerente' && section === 'users' ? <ManagerUsers data={data} changeData={changeData} notify={notify} setModal={setModal} /> : null}
+          {session?.role === 'gerente' && section === 'tables' ? <ManagerTables data={data} changeData={changeData} notify={notify} setModal={setModal} reloadTables={loadApiTables} /> : null}
+          {session?.role === 'gerente' && section === 'users' ? <ManagerUsers data={data} changeData={changeData} notify={notify} setModal={setModal} reloadUsers={loadApiUsers} /> : null}
           {session?.role === 'gerente' && section === 'orders' ? <ManagerOrders data={data} /> : null}
           {session?.role === 'gerente' && section === 'reports' ? (
             <SalesReport data={data} start={reportStart} end={reportEnd} setStart={setReportStart} setEnd={setReportEnd} />
           ) : null}
-          {session?.role === 'cocinero' && section === 'overview' ? <CookOverview data={data} session={session} setSection={setSection} /> : null}
-          {session?.role === 'cocinero' && section === 'pending' ? <CookOrders data={data} session={session} changeData={changeData} notify={notify} /> : null}
+          {session?.role === 'cocinero' && section === 'overview' ? <CookOverview orders={kitchenOrders} session={session} setSection={setSection} updateKitchenOrder={updateKitchenOrder} /> : null}
+          {session?.role === 'cocinero' && section === 'pending' ? <CookOrders orders={kitchenOrders} updateKitchenOrder={updateKitchenOrder} notify={notify} /> : null}
           {session?.role === 'cocinero' && section === 'served' ? <CookHistory data={data} session={session} /> : null}
           {session?.role === 'mesero' && section === 'overview' ? <WaiterOverview data={data} setSection={setSection} /> : null}
           {session?.role === 'mesero' && section === 'tables' ? <WaiterTables data={data} /> : null}
@@ -392,10 +646,10 @@ function App() {
         </main>
       </div>
 
-      {loginOpen ? <LoginModal onLogin={login} onClose={() => setLoginOpen(false)} /> : null}
-      {modal?.type === 'product' ? <ProductModal product={modal.product} data={data} onSave={(product) => saveProduct(product, data, changeData, notify, setModal)} onClose={() => setModal(null)} /> : null}
-      {modal?.type === 'table' ? <TableModal table={modal.table} onSave={(table) => saveTable(table, data, changeData, notify, setModal)} onClose={() => setModal(null)} /> : null}
-      {modal?.type === 'user' ? <UserModal user={modal.user} onSave={(user) => saveUser(user, data, changeData, notify, setModal)} onClose={() => setModal(null)} /> : null}
+      {tableChangeRequest ? <TableChangeAuthorization nextTableId={tableChangeRequest} onAuthorize={authorizeTableChange} onClose={() => setTableChangeRequest(null)} /> : null}
+      {modal?.type === 'product' ? <ProductModal product={modal.product} data={data} onSave={(product) => saveProduct(product, data, changeData, notify, setModal, loadApiMenu)} onClose={() => setModal(null)} /> : null}
+      {modal?.type === 'table' ? <TableModal table={modal.table} onSave={(table) => saveTable(table, data, changeData, notify, setModal, loadApiTables)} onClose={() => setModal(null)} /> : null}
+      {modal?.type === 'user' ? <UserModal user={modal.user} onSave={(user) => saveUser(user, data, changeData, notify, setModal, loadApiUsers)} onClose={() => setModal(null)} /> : null}
       {payment ? (
         <PaymentModal
           data={data}
@@ -469,7 +723,7 @@ function GuestOrder({ data, cart, tableId, cartTotal, updateCartItem, sendOrder,
           <div className="cart-list">{items.map((item) => {
             const product = data.products.find((candidate) => candidate.id === item.productId)
             if (!product) return null
-            return <article className="cart-item" key={product.id}><img src={product.image || fallbackFoodImage} onError={handleImageError} alt="" /><div className="cart-item-info"><strong>{product.name}</strong><span>{money(product.price)} · {product.area === 'barra' ? 'Barra' : 'Cocina'}</span><label className="comment-input">Nota para cocina <input value={item.comments} onChange={(event) => updateCartItem(product.id, { comments: event.target.value })} placeholder="Sin cebolla, por favor…" maxLength={120} /></label></div><div className="cart-item-end"><strong>{money(product.price * item.quantity)}</strong><div className="quantity-control"><button onClick={() => updateCartItem(product.id, { quantity: item.quantity - 1 })} aria-label="Quitar una unidad">−</button><span>{item.quantity}</span><button onClick={() => updateCartItem(product.id, { quantity: item.quantity + 1 })} aria-label="Agregar una unidad">+</button></div><button className="remove-link" onClick={() => updateCartItem(product.id, { quantity: 0 })}>Quitar</button></div></article>
+            return <article className="cart-item" key={product.id}><img src={product.image || fallbackFoodImage} onError={handleImageError} alt="" /><div className="cart-item-info"><strong>{product.name}</strong><span>{money(product.price)} · {product.area === 'barra' ? 'Barra' : 'Cocina'}</span><label className="comment-input">Nota para cocina <input value={item.comments} onChange={(event) => updateCartItem(product.id, { comments: event.target.value })} placeholder="Describir preferencias..." maxLength={120} /></label></div><div className="cart-item-end"><strong>{money(product.price * item.quantity)}</strong><div className="quantity-control"><button onClick={() => updateCartItem(product.id, { quantity: item.quantity - 1 })} aria-label="Quitar una unidad">−</button><span>{item.quantity}</span><button onClick={() => updateCartItem(product.id, { quantity: item.quantity + 1 })} aria-label="Agregar una unidad">+</button></div><button className="remove-link" onClick={() => updateCartItem(product.id, { quantity: 0 })}>Quitar</button></div></article>
           })}</div>
           <div className="cart-summary"><div><span>Subtotal</span><strong>{money(cartTotal)}</strong></div><p>Los precios incluyen IVA. El pago se realiza al finalizar tu visita.</p><button className="button button-dark button-wide" onClick={sendOrder}>Enviar pedido a cocina <span>→</span></button><button className="text-button center-button" onClick={onBrowse}>Seguir explorando el menú</button></div>
         </>
@@ -501,7 +755,7 @@ function GuestAccount({ data, tableId, billTotal, requestAccount, onBrowse }) {
   )
 }
 
-function LoginModal({ onLogin, onClose }) {
+function LoginModal({ onLogin, onClose, standalone = false }) {
   const [role, setRole] = useState('gerente')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -510,10 +764,55 @@ function LoginModal({ onLogin, onClose }) {
     setUsername(account)
     setPassword('Lumbre2026')
   }
-  return <div className="modal-backdrop" onClick={onClose}><div className="modal login-modal" onClick={(event) => event.stopPropagation()}><button className="modal-close" onClick={onClose} aria-label="Cerrar">×</button><div className="login-brand"><span className="brand-mark">L</span><span className="eyebrow">SISTEMA DE OPERACIÓN</span></div><h2>Bienvenido al equipo.</h2><p className="login-intro">Ingresa con las credenciales asignadas por gerencia.</p>
-    <form onSubmit={(event) => onLogin(event, { role, username, password })}><label className="form-field">Área de trabajo<select value={role} onChange={(event) => setRole(event.target.value)}>{Object.entries(roles).map(([id, item]) => <option value={id} key={id}>{item.label}</option>)}</select></label><label className="form-field">Usuario<input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} placeholder="Tu nombre de usuario" /></label><label className="form-field">Contraseña<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Tu contraseña" /></label><button className="button button-dark button-wide" type="submit">Iniciar sesión <span>→</span></button></form>
-    <div className="demo-access"><span>ACCESO DEMOSTRACIÓN</span><div>{demoAccounts.map(([account, accountRole]) => <button key={accountRole} onClick={() => fillDemo(account, accountRole)}>{roles[accountRole].label}</button>)}</div><small>Al elegir un perfil se completa la contraseña de demostración: <strong>Lumbre2026</strong></small></div>
-  </div></div>
+  const content = (
+    <div className="modal login-modal">
+      {!standalone ? <button className="modal-close" onClick={onClose} aria-label="Cerrar">×</button> : null}
+      <div className="login-brand"><span className="brand-mark">L</span><span className="eyebrow">SISTEMA DE OPERACIÓN</span></div>
+      <h2>Bienvenido al equipo.</h2>
+      <p className="login-intro">Ingresa con las credenciales asignadas por gerencia.</p>
+      <form onSubmit={(event) => onLogin(event, { role, username, password })}>
+        <label className="form-field">Área de trabajo<select value={role} onChange={(event) => setRole(event.target.value)}>{Object.entries(roles).map(([id, item]) => <option value={id} key={id}>{item.label}</option>)}</select></label>
+        <label className="form-field">Usuario<input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} placeholder="Tu nombre de usuario" /></label>
+        <label className="form-field">Contraseña<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Tu contraseña" /></label>
+        <button className="button button-dark button-wide" type="submit">Iniciar sesión <span>→</span></button>
+      </form>
+      {/* <div className="demo-access"><span>ACCESO DEMOSTRACIÓN</span><div>{demoAccounts.map(([account, accountRole]) => <button key={accountRole} onClick={() => fillDemo(account, accountRole)}>{roles[accountRole].label}</button>)}</div><small>Al elegir un perfil se completa la contraseña de demostración: <strong>Lumbre2026</strong></small></div> */}
+    </div>
+  )
+
+  return standalone ? (
+    <main className="staff-login-page">
+      <a className="staff-login-back" href="/" onClick={(event) => { event.preventDefault(); onClose() }}>← Volver a la mesa</a>
+      {content}
+    </main>
+  ) : (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div onClick={(event) => event.stopPropagation()}>{content}</div>
+    </div>
+  )
+}
+
+function TableChangeAuthorization({ nextTableId, onAuthorize, onClose }) {
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal login-modal" onClick={(event) => event.stopPropagation()}>
+        <button className="modal-close" onClick={onClose} aria-label="Cerrar">×</button>
+        <p className="eyebrow">AUTORIZACIÓN DEL PERSONAL</p>
+        <h2>Cambiar a la mesa {String(nextTableId).padStart(2, '0')}</h2>
+        <p className="login-intro">Ingresa las credenciales de un gerente o mesero activo.</p>
+        <form onSubmit={(event) => { event.preventDefault(); onAuthorize({ username, password }) }}>
+          <label className="form-field">Usuario del personal<input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required /></label>
+          <label className="form-field">Contraseña<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
+          <div className="modal-actions">
+            <button className="button button-outline" type="button" onClick={onClose}>Cancelar</button>
+            <button className="button button-dark" type="submit">Autorizar cambio <span>→</span></button>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
 }
 
 function ManagerOverview({ data, setSection }) {
@@ -549,21 +848,46 @@ function ManagerMenu({ data, changeData, notify, setModal }) {
   </>
 }
 
-function ManagerTables({ data, changeData, notify, setModal }) {
+function ManagerTables({ data, changeData, notify, setModal, reloadTables }) {
   const activeTables = data.tables.filter((table) => table.active)
   return <><PageHeading eyebrow="ADMINISTRACIÓN DEL RESTAURANTE" title="Mesas" description="Organiza las mesas y consulta su estado de servicio." action={<button className="button button-dark" onClick={() => setModal({ type: 'table', table: null })}>＋ Agregar mesa</button>} /><div className="table-cards">{activeTables.map((table) => {
     const status = tableStatus(data, table.id)
     return <article className={`table-card ${status === 'Libre' ? '' : 'table-card-busy'}`} key={table.id}><div className="table-card-top"><span className="table-chip">M{table.name}</span><StatusBadge status={status} /></div><div className="table-number">{table.name}</div><span className="table-capacity">Capacidad para {table.capacity} personas</span><div className="table-card-bottom"><span>{money(tableTotal(data, table.id))}</span><button className="row-action" onClick={() => setModal({ type: 'table', table })}>Editar mesa</button><button className="row-action danger-link" onClick={() => {
       if (tableOrders(data, table.id).length) { notify('No se puede desactivar una mesa con cuenta abierta.', 'error'); return }
-      changeData((current) => ({ ...current, tables: current.tables.map((item) => item.id === table.id ? { ...item, active: false } : item) }), 'Mesas', `Mesa ${table.name} desactivada.`)
+      fetch(`http://localhost:8080/SistemaPedidosBackend/api/mesas/${encodeURIComponent(table.id)}/estado`, {
+        method: 'PATCH',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: table.id, active: false, disponibilidad: false }),
+      }).then((response) => {
+        if (!response.ok) throw new Error('No fue posible desactivar la mesa')
+        return reloadTables()
+      }).then(() => {
+        changeData((current) => ({ ...current, tables: current.tables.map((item) => item.id === table.id ? { ...item, active: false } : item) }), 'Mesas', `Mesa ${table.name} desactivada.`)
+      }).catch((error) => notify(error.message, 'error'))
       notify('Mesa desactivada.')
     }}>Desactivar</button></div></article>
   })}</div>{activeTables.length === 0 ? <EmptyState title="No hay mesas activas" description="Agrega una mesa para empezar a recibir pedidos." /> : null}</>
 }
 
-function ManagerUsers({ data, changeData, notify, setModal }) {
+function ManagerUsers({ data, changeData, notify, setModal, reloadUsers }) {
   const staff = data.users.filter((user) => user.role !== 'gerente' && user.role !== 'adminred')
-  return <><PageHeading eyebrow="ADMINISTRACIÓN DEL RESTAURANTE" title="Equipo" description="Administra accesos y áreas de preparación del personal." action={<button className="button button-dark" onClick={() => setModal({ type: 'user', user: null })}>＋ Agregar persona</button>} /><section className="panel staff-panel"><div className="table-scroll"><table><thead><tr><th>PERSONA</th><th>USUARIO</th><th>ROL</th><th>ÁREA</th><th>ESTADO</th><th>ACCIONES</th></tr></thead><tbody>{staff.map((user) => <tr key={user.id}><td className="strong-cell">{user.name}</td><td>{user.username}</td><td>{roles[user.role]?.label}</td><td>{user.role === 'cocinero' ? user.area === 'barra' ? 'Barra' : 'Cocina' : '—'}</td><td><StatusBadge status={user.active ? 'Activo' : 'Inactivo'} /></td><td><button className="row-action" onClick={() => setModal({ type: 'user', user })}>Editar</button><button className="row-action" onClick={() => { changeData((current) => ({ ...current, users: current.users.map((item) => item.id === user.id ? { ...item, active: !item.active } : item) }), 'Personal', `${user.active ? 'Usuario desactivado' : 'Usuario activado'}: ${user.username}.`); notify(user.active ? 'Acceso desactivado.' : 'Acceso activado.') }}>{user.active ? 'Desactivar' : 'Activar'}</button></td></tr>)}</tbody></table></div></section><p className="page-footnote">Las contraseñas de esta versión de demostración se guardan en el navegador. No uses datos reales.</p></>
+  const toggleUser = async (user) => {
+    try {
+      const response = await fetch('http://localhost:8080/SistemaPedidosBackend/api/usuarios', {
+        method: 'PUT',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...user, active: !user.active }),
+      })
+      if (!response.ok) throw new Error('No fue posible actualizar el usuario')
+      await reloadUsers()
+      notify(user.active ? 'Acceso desactivado.' : 'Acceso activado.')
+    } catch (error) {
+      notify(error.message, 'error')
+    }
+  }
+  return <><PageHeading eyebrow="ADMINISTRACIÓN DEL RESTAURANTE" title="Equipo" description="Administra accesos y áreas de preparación del personal." action={<button className="button button-dark" onClick={() => setModal({ type: 'user', user: null })}>＋ Agregar persona</button>} /><section className="panel staff-panel"><div className="table-scroll"><table><thead><tr><th>PERSONA</th><th>USUARIO</th><th>ROL</th><th>ÁREA</th><th>ESTADO</th><th>ACCIONES</th></tr></thead><tbody>{staff.map((user) => <tr key={user.id}><td className="strong-cell">{user.name}</td><td>{user.username}</td><td>{roles[user.role]?.label}</td><td>{user.role === 'cocinero' ? user.area === 'barra' ? 'Barra' : 'Cocina' : '—'}</td><td><StatusBadge status={user.active ? 'Activo' : 'Inactivo'} /></td><td><button className="row-action" onClick={() => setModal({ type: 'user', user })}>Editar</button><button className="row-action" onClick={() => toggleUser(user)}>{user.active ? 'Desactivar' : 'Activar'}</button></td></tr>)}</tbody></table></div></section></>
 }
 
 function ManagerOrders({ data }) {
@@ -574,21 +898,21 @@ function ManagerOrders({ data }) {
   return <><PageHeading eyebrow="ADMINISTRACIÓN DEL RESTAURANTE" title="Pedidos" description="Da seguimiento a cada pedido desde su recepción hasta la entrega." action={<input className="date-control" type="date" value={date} onChange={(event) => setDate(event.target.value)} aria-label="Filtrar por fecha" />} /><div className="list-toolbar"><div className="filter-pills">{['Todos', 'Pendiente', 'En preparación', 'Listo', 'Servido'].map((item) => <button key={item} className={status === item ? 'filter-active' : ''} onClick={() => setStatus(item)}>{item}</button>)}</div><select className="filter-select" value={table} onChange={(event) => setTable(event.target.value)}><option>Todas</option>{data.tables.map((item) => <option key={item.id} value={item.id}>Mesa {item.name}</option>)}</select></div><section className="panel"><OrderTable orders={orders} tables={data.tables} /></section></>
 }
 
-function CookOverview({ data, session, setSection }) {
-  const pending = data.orders.filter((order) => !order.paid && order.area === session.area && order.status !== 'Listo' && order.status !== 'Servido')
-  const ready = data.orders.filter((order) => !order.paid && order.area === session.area && order.status === 'Listo')
-  return <><PageHeading eyebrow={`ÁREA DE PREPARACIÓN · ${session.area === 'barra' ? 'BARRA' : 'COCINA'}`} title={`Hola, ${session.name.split(' ')[0]}.`} description="Cada plato cuenta. Aquí tienes lo que sigue en tu estación." action={<span className="live-pill"><span /> ACTUALIZACIÓN AUTOMÁTICA</span>} /><div className="stats-grid"><StatCard label="POR PREPARAR" value={pending.length} note="Pedidos en orden de llegada" accent /><StatCard label="LISTOS PARA SERVIR" value={ready.length} note="Esperando al equipo de piso" /><StatCard label="ÁREA ASIGNADA" value={session.area === 'barra' ? 'Barra' : 'Cocina'} note="Pedidos filtrados por estación" /></div><section className="panel dashboard-panel"><PanelHeading title="Siguiente en la fila" link="Abrir preparación" onClick={() => setSection('pending')} /><CookOrderList orders={pending.slice(0, 3)} changeData={() => { }} notify={() => { }} /></section></>
+function CookOverview({ orders, session, setSection, updateKitchenOrder }) {
+  const pending = orders.filter((order) => order.status !== 'Listo' && order.status !== 'Servido')
+  const ready = orders.filter((order) => order.status === 'Listo')
+  return <><PageHeading eyebrow={`ÁREA DE PREPARACIÓN · ${session.area === 'barra' ? 'BARRA' : 'COCINA'}`} title={`Hola, ${session.name.split(' ')[0]}.`} description="Cada plato cuenta. Aquí tienes lo que sigue en tu estación." action={<span className="live-pill"><span /> ACTUALIZACIÓN AUTOMÁTICA</span>} /><div className="stats-grid"><StatCard label="POR PREPARAR" value={pending.length} note="Pedidos en orden de llegada" accent /><StatCard label="LISTOS PARA SERVIR" value={ready.length} note="Esperando al equipo de piso" /><StatCard label="ÁREA ASIGNADA" value={session.area === 'barra' ? 'Barra' : 'Cocina'} note="Pedidos filtrados por estación" /></div><section className="panel dashboard-panel"><PanelHeading title="Siguiente en la fila" link="Abrir preparación" onClick={() => setSection('pending')} /><CookOrderList orders={pending.slice(0, 3)} updateKitchenOrder={updateKitchenOrder} notify={() => { }} /></section></>
 }
 
-function CookOrders({ data, session, changeData, notify }) {
+function CookOrders({ orders, updateKitchenOrder, notify }) {
   const [filter, setFilter] = useState('Activos')
-  const orders = data.orders.filter((order) => !order.paid && order.area === session.area && (filter === 'Activos' ? order.status === 'Pendiente' || order.status === 'En preparación' : order.status === 'Listo')).sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
-  return <><PageHeading eyebrow={`${session.area === 'barra' ? 'BARRA' : 'COCINA'} · PREPARACIÓN`} title="Comandas" description="Prepara los pedidos por orden de llegada y actualiza su avance." action={<span className="live-pill"><span /> EN VIVO</span>} /><div className="list-toolbar"><div className="filter-pills">{['Activos', 'Listos'].map((item) => <button key={item} className={filter === item ? 'filter-active' : ''} onClick={() => setFilter(item)}>{item}</button>)}</div><span>{orders.length} {orders.length === 1 ? 'comanda' : 'comandas'}</span></div><CookOrderList orders={orders} changeData={changeData} notify={notify} /></>
+  const filteredOrders = orders.filter((order) => filter === 'Activos' ? order.status === 'Pendiente' || order.status === 'En preparación' : order.status === 'Listo').sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+  return <><PageHeading eyebrow="COCINA · PREPARACIÓN" title="Comandas" description="Prepara los pedidos por orden de llegada y actualiza su avance." action={<span className="live-pill"><span /> EN VIVO</span>} /><div className="list-toolbar"><div className="filter-pills">{['Activos', 'Listos'].map((item) => <button key={item} className={filter === item ? 'filter-active' : ''} onClick={() => setFilter(item)}>{item}</button>)}</div><span>{filteredOrders.length} {filteredOrders.length === 1 ? 'comanda' : 'comandas'}</span></div><CookOrderList orders={filteredOrders} updateKitchenOrder={updateKitchenOrder} notify={notify} /></>
 }
 
-function CookOrderList({ orders, changeData, notify }) {
+function CookOrderList({ orders, updateKitchenOrder }) {
   if (!orders.length) return <EmptyState title="No hay pedidos pendientes" description="Las comandas nuevas aparecerán aquí automáticamente." />
-  return <div className="kitchen-grid">{orders.map((order) => <article className={`kitchen-ticket ticket-${order.status.toLowerCase().replaceAll(' ', '-')}`} key={order.id}><div className="ticket-header"><span className="table-chip">M{order.tableId.padStart(2, '0')}</span><span className="ticket-time">{shortTime(order.createdAt)}</span><StatusBadge status={order.status} /></div><div className="ticket-id">{order.id}</div><div className="ticket-items">{order.items.map((item) => <div className="ticket-item" key={item.productId}><strong>{item.quantity}<span>×</span></strong><div><b>{item.name}</b>{item.comments ? <small>Nota: {item.comments}</small> : null}</div></div>)}</div>{order.status !== 'Listo' ? <button className="button button-dark button-wide" onClick={() => { const nextStatus = order.status === 'Pendiente' ? 'En preparación' : 'Listo'; changeData((current) => ({ ...current, orders: current.orders.map((item) => item.id === order.id ? { ...item, status: nextStatus, updatedAt: new Date().toISOString(), ...(nextStatus === 'Listo' ? { readyAt: new Date().toISOString() } : {}) } : item) }), 'Pedido', `${order.id} actualizado a ${nextStatus}.`); notify(nextStatus === 'Listo' ? 'Pedido listo. Servicio ya puede entregarlo.' : 'Pedido en preparación.') }}>{order.status === 'Pendiente' ? 'Comenzar preparación' : 'Marcar como listo'} <span>→</span></button> : <div className="ready-confirmation"><span>✓</span> Listo para entregar</div>}</article>)}</div>
+  return <div className="kitchen-grid">{orders.map((order) => <article className={`kitchen-ticket ticket-${String(order.status).toLowerCase().replaceAll(' ', '-')}`} key={order.id}><div className="ticket-header"><span className="table-chip">M{String(order.tableId || '').padStart(2, '0')}</span><span className="ticket-time">{shortTime(order.createdAt)}</span><StatusBadge status={order.status} /></div><div className="ticket-id">{order.id}</div><div className="ticket-items">{(order.items || []).map((item, index) => <div className="ticket-item" key={item.productId || index}><strong>{item.quantity}<span>×</span></strong><div><b>{item.name}</b>{item.comments ? <small>Nota: {item.comments}</small> : null}</div></div>)}</div>{order.status !== 'Listo' ? <button className="button button-dark button-wide" onClick={() => { const nextStatus = order.status === 'Pendiente' ? 'En preparación' : 'Listo'; updateKitchenOrder(order.id, nextStatus); }}>{order.status === 'Pendiente' ? 'Comenzar preparación' : 'Marcar como listo'} <span>→</span></button> : <div className="ready-confirmation"><span>✓</span> Listo para entregar</div>}</article>)}</div>
 }
 
 function CookHistory({ data, session }) {
@@ -794,16 +1118,29 @@ function ProductModal({ product, data, onSave, onClose }) {
   return <div className="modal-backdrop" onClick={onClose}><div className="modal form-modal" onClick={(event) => event.stopPropagation()}><button className="modal-close" onClick={onClose} aria-label="Cerrar">×</button><p className="eyebrow">ADMINISTRACIÓN DEL MENÚ</p><h2>{product ? 'Editar producto' : 'Agregar producto'}</h2><form onSubmit={(event) => { event.preventDefault(); onSave(form) }}><label className="form-field">Nombre del producto<input value={form.name} onChange={(event) => update('name', event.target.value)} required maxLength={80} /></label><label className="form-field">Descripción <span>OPCIONAL</span><textarea value={form.description} onChange={(event) => update('description', event.target.value)} rows="3" maxLength={220} /></label><div className="form-row"><label className="form-field">Precio (MXN)<input type="number" min="0.01" step="0.01" value={form.price} onChange={(event) => update('price', event.target.value)} required /></label><label className="form-field">Categoría<select value={form.category} onChange={(event) => update('category', event.target.value)}>{[...new Set([...categories, ...data.products.map((item) => item.category)])].map((item) => <option key={item}>{item}</option>)}</select></label></div><div className="form-row"><label className="form-field">Área de preparación<select value={form.area} onChange={(event) => update('area', event.target.value)}><option value="cocina">Cocina</option><option value="barra">Barra</option></select></label><label className="form-field">Fotografía (URL) <span>OPCIONAL</span><input type="url" value={form.image} onChange={(event) => update('image', event.target.value)} placeholder="https://…" /></label></div><label className="checkbox-field"><input type="checkbox" checked={form.active} onChange={(event) => update('active', event.target.checked)} /> Disponible en el menú para comensales</label><div className="modal-actions"><button className="button button-outline" type="button" onClick={onClose}>Cancelar</button><button className="button button-dark" type="submit">{product ? 'Guardar cambios' : 'Guardar producto'}</button></div></form></div></div>
 }
 
-function saveProduct(product, data, changeData, notify, setModal) {
+async function saveProduct(product, data, changeData, notify, setModal, reloadMenu) {
   const name = product.name.trim()
   if (!name || !product.category || !product.area) { notify('Completa los campos obligatorios.', 'error'); return }
   if (!Number.isFinite(Number(product.price)) || Number(product.price) <= 0) { notify('El precio debe ser mayor a cero.', 'error'); return }
   const duplicate = data.products.some((item) => item.id !== product.id && item.name.toLowerCase() === name.toLowerCase() && item.category === product.category)
   if (duplicate) { notify('Este producto ya existe en la categoría.', 'error'); return }
-  const value = { ...product, name, price: Number(product.price), id: product.id || `p-${Date.now()}`, active: Boolean(product.active), emoji: product.emoji || '🍽️' }
-  changeData((current) => ({ ...current, products: product.id ? current.products.map((item) => item.id === product.id ? value : item) : [...current.products, value] }), 'Menú', `Producto ${product.id ? 'actualizado' : 'agregado'}: ${name}.`)
-  setModal(null)
-  notify('Producto guardado correctamente.')
+  const value = { ...product, name, price: Number(product.price), active: Boolean(product.active), emoji: product.emoji || '🍽️' }
+  if (!product.id) delete value.id
+  try {
+    const response = await fetch('http://localhost:8080/SistemaPedidosBackend/api/menu', {
+      method: product.id ? 'PUT' : 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(value),
+    })
+    if (!response.ok) throw new Error('No fue posible guardar el producto')
+    await reloadMenu()
+    changeData((current) => current, 'Menú', `Producto ${product.id ? 'actualizado' : 'agregado'}: ${name}.`)
+    setModal(null)
+    notify('Producto guardado correctamente.')
+  } catch (error) {
+    notify(error.message, 'error')
+  }
 }
 
 function TableModal({ table, onSave, onClose }) {
@@ -812,12 +1149,27 @@ function TableModal({ table, onSave, onClose }) {
   return <div className="modal-backdrop" onClick={onClose}><div className="modal form-modal compact-modal" onClick={(event) => event.stopPropagation()}><button className="modal-close" onClick={onClose} aria-label="Cerrar">×</button><p className="eyebrow">ADMINISTRACIÓN DEL RESTAURANTE</p><h2>{table ? 'Editar mesa' : 'Agregar mesa'}</h2><form onSubmit={(event) => { event.preventDefault(); onSave({ ...table, name: name.trim(), capacity: Number(capacity), id: table?.id || `table-${Date.now()}` }) }}><label className="form-field">Número o nombre de la mesa<input value={name} onChange={(event) => setName(event.target.value)} required maxLength={30} /></label><label className="form-field">Capacidad<input type="number" min="1" max="40" value={capacity} onChange={(event) => setCapacity(event.target.value)} /></label><div className="modal-actions"><button className="button button-outline" type="button" onClick={onClose}>Cancelar</button><button className="button button-dark" type="submit">Guardar mesa</button></div></form></div></div>
 }
 
-function saveTable(table, data, changeData, notify, setModal) {
+async function saveTable(table, data, changeData, notify, setModal, reloadTables) {
   if (!table.name) { notify('El número o nombre de la mesa es obligatorio.', 'error'); return }
   if (data.tables.some((item) => item.id !== table.id && item.name.toLowerCase() === table.name.toLowerCase())) { notify('Esta mesa ya existe.', 'error'); return }
-  changeData((current) => ({ ...current, tables: table.id.startsWith('table-') ? [...current.tables, { ...table, active: true }] : current.tables.map((item) => item.id === table.id ? table : item) }), 'Mesas', `Mesa ${table.name} guardada.`)
-  setModal(null)
-  notify('Mesa guardada correctamente.')
+  const isNew = !table.id || String(table.id).startsWith('table-')
+  const payload = { ...table, active: table.active !== false }
+  if (isNew) delete payload.id
+  try {
+  const response = await fetch('http://localhost:8080/SistemaPedidosBackend/api/mesas', {
+      method: isNew ? 'POST' : 'PUT',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) throw new Error('No fue posible guardar la mesa')
+    await reloadTables()
+    changeData((current) => ({ ...current, tables: current.tables }), 'Mesas', `Mesa ${table.name} guardada.`)
+    setModal(null)
+    notify('Mesa guardada correctamente.')
+  } catch (error) {
+    notify(error.message, 'error')
+  }
 }
 
 function UserModal({ user, onSave, onClose }) {
@@ -826,16 +1178,27 @@ function UserModal({ user, onSave, onClose }) {
   return <div className="modal-backdrop" onClick={onClose}><div className="modal form-modal compact-modal" onClick={(event) => event.stopPropagation()}><button className="modal-close" onClick={onClose} aria-label="Cerrar">×</button><p className="eyebrow">ADMINISTRACIÓN DEL PERSONAL</p><h2>{user ? 'Editar acceso' : 'Agregar persona'}</h2><form onSubmit={(event) => { event.preventDefault(); onSave(form) }}><label className="form-field">Nombre completo<input value={form.name} onChange={(event) => update('name', event.target.value)} required /></label><label className="form-field">Nombre de usuario<input value={form.username} onChange={(event) => update('username', event.target.value)} required autoComplete="off" /></label><label className="form-field">Contraseña{user ? <span>OPCIONAL</span> : null}<input type="password" value={form.password} onChange={(event) => update('password', event.target.value)} required={!user} minLength="8" placeholder={user ? 'Deja en blanco para conservarla' : 'Mínimo 8 caracteres'} autoComplete="new-password" /></label><label className="form-field">Rol<select value={form.role} onChange={(event) => update('role', event.target.value)}><option value="cocinero">Cocinero</option><option value="mesero">Mesero</option><option value="cajero">Cajero</option></select></label>{form.role === 'cocinero' ? <label className="form-field">Área de preparación<select value={form.area} onChange={(event) => update('area', event.target.value)}><option value="cocina">Cocina</option><option value="barra">Barra</option></select></label> : null}<label className="checkbox-field"><input type="checkbox" checked={form.active} onChange={(event) => update('active', event.target.checked)} /> Acceso activo</label><div className="modal-actions"><button className="button button-outline" type="button" onClick={onClose}>Cancelar</button><button className="button button-dark" type="submit">Guardar acceso</button></div></form></div></div>
 }
 
-function saveUser(user, data, changeData, notify, setModal) {
+async function saveUser(user, data, changeData, notify, setModal, reloadUsers) {
   const username = user.username.trim()
   if (!user.name.trim() || !username || !user.role) { notify('Completa los campos obligatorios.', 'error'); return }
   if (data.users.some((item) => item.id !== user.id && item.username.toLowerCase() === username.toLowerCase())) { notify('Este nombre de usuario ya existe.', 'error'); return }
   if ((!user.id || user.password) && user.password.length < 8) { notify('La contraseña debe tener al menos 8 caracteres.', 'error'); return }
-  const value = { ...user, name: user.name.trim(), username, id: user.id || `u-${Date.now()}` }
-  if (user.id && !user.password) value.password = data.users.find((item) => item.id === user.id)?.password
-  changeData((current) => ({ ...current, users: user.id ? current.users.map((item) => item.id === user.id ? value : item) : [...current.users, value] }), 'Personal', `Acceso ${user.id ? 'actualizado' : 'creado'}: ${username}.`)
-  setModal(null)
-  notify('Usuario guardado correctamente.')
+  const value = { ...user, name: user.name.trim(), username }
+  if (!value.password) delete value.password
+  try {
+    const response = await fetch('http://localhost:8080/SistemaPedidosBackend/api/usuarios', {
+      method: user.id ? 'PUT' : 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(value),
+    })
+    if (!response.ok) throw new Error('No fue posible guardar el usuario')
+    await reloadUsers()
+    setModal(null)
+    notify('Usuario guardado correctamente.')
+  } catch (error) {
+    notify(error.message, 'error')
+  }
 }
 
 function PaymentModal({ data, tableId, method, setMethod, received, setReceived, onClose, onConfirm }) {
@@ -845,7 +1208,7 @@ function PaymentModal({ data, tableId, method, setMethod, received, setReceived,
   return <div className="modal-backdrop" onClick={onClose}><div className="modal payment-modal" onClick={(event) => event.stopPropagation()}><button className="modal-close" onClick={onClose} aria-label="Cerrar">×</button><p className="eyebrow">COBRO DE CUENTA · MESA {tableId.padStart(2, '0')}</p><h2>Registrar pago</h2><div className="payment-modal-total"><span>Total a cobrar</span><strong>{money(total)}</strong></div><label className="form-field">Método de pago<select value={method} onChange={(event) => setMethod(event.target.value)}><option>Efectivo</option><option>Tarjeta</option></select></label>{method === 'Efectivo' ? <><label className="form-field">Monto recibido<input type="number" min={total} step="0.01" value={received} onChange={(event) => setReceived(event.target.value)} placeholder="0.00" /></label><div className="change-amount"><span>Cambio</span><strong>{money(change)}</strong></div></> : <p className="page-footnote">Procesa el cobro en la terminal del restaurante. No se almacenan datos de tarjeta.</p>}<div className="modal-actions"><button className="button button-outline" onClick={onClose}>Cancelar</button><button className="button button-dark" onClick={onConfirm}>Confirmar pago</button></div></div></div>
 }
 
-function confirmPayment(tableId, method, received, session, data, changeData, notify, setPayment) {
+async function confirmPayment(tableId, method, received, session, data, changeData, notify, setPayment) {
   const total = tableTotal(data, tableId)
   if (method === 'Efectivo' && Number(received) < total) { notify('El monto recibido es menor al total.', 'error'); return }
   if (!tableOrders(data, tableId).length) { notify('No hay una cuenta pendiente para esta mesa.', 'error'); setPayment(null); return }
@@ -862,14 +1225,33 @@ function confirmPayment(tableId, method, received, session, data, changeData, no
     cashier: session?.name || 'Caja',
     items: paidOrders.flatMap((order) => order.items),
   }
-  changeData((current) => ({
-    ...current,
-    orders: current.orders.map((order) => order.tableId === tableId && !order.paid ? { ...order, paid: true, paidAt } : order),
-    sales: [...current.sales, sale],
-    accounts: { ...current.accounts, [tableId]: { ...current.accounts[tableId], requested: false, paidAt, saleId: paymentId } },
-  }), 'Pago', `Pago de ${money(total)} registrado para la mesa ${tableId.padStart(2, '0')} (${method.toLowerCase()}).`)
-  setPayment(null)
-  notify('Pago registrado correctamente.')
+  try {
+    const response = await fetch('http://localhost:8080/SistemaPedidosBackend/api/pagos', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mesaId: tableId,
+        metodo: method,
+        total,
+        montoRecibido: method === 'Efectivo' ? Number(received) : total,
+        cambio: method === 'Efectivo' ? Math.max(0, Number(received) - total) : 0,
+        cajeroId: session?.id,
+        items: sale.items,
+      }),
+    })
+    if (!response.ok) throw new Error('No fue posible registrar el pago')
+    changeData((current) => ({
+      ...current,
+      orders: current.orders.map((order) => order.tableId === tableId && !order.paid ? { ...order, paid: true, paidAt } : order),
+      sales: [...current.sales, sale],
+      accounts: { ...current.accounts, [tableId]: { ...current.accounts[tableId], requested: false, paidAt, saleId: paymentId } },
+    }), 'Pago', `Pago de ${money(total)} registrado para la mesa ${tableId.padStart(2, '0')} (${method.toLowerCase()}).`)
+    setPayment(null)
+    notify('Pago registrado correctamente.')
+  } catch (error) {
+    notify(error.message, 'error')
+  }
 }
 
 export default App

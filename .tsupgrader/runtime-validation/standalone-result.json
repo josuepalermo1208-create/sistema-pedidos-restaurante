@@ -1,0 +1,126 @@
+{
+  "planHash": "05156c2535279c1a12bad66f2d8bc86710fb69ae5c2188b0ea8a67e05ae06deb",
+  "phase": "standalone",
+  "recordedAtUtc": "2026-11-10T20:13:59.6072816Z",
+  "retryCount": 2,
+  "resetBaseline": false,
+  "complete": true,
+  "result": {
+    "setupSucceeded": true,
+    "setupDurationMs": 0,
+    "setupFailureOutput": null,
+    "assertions": [
+      {
+        "name": "production-build",
+        "kind": "process",
+        "verificationMethod": "exit-code",
+        "passed": true,
+        "timedOut": false,
+        "skipped": false,
+        "skippedReason": null,
+        "exitCode": 0,
+        "outputSample": "\r\n\u003E sistema-pedidos@0.0.0 build\r\n\u003E vite build\r\n\r\n\u001B[36mvite v8.3.5 \u001B[32mbuilding client environment for production...\u001B[36m\u001B[39m\r\ntransforming...\r\n\u2713 18 modules transformed.\r\nrendering chunks...\r\ncomputing gzip size...\r\ndist/index.html                   0.55 kB \u2502 gzip:  0.34 kB\r\ndist/assets/index-BNJLWvj5.css   38.86 kB \u2502 gzip:  8.71 kB\r\ndist/assets/index-DqnbgZmQ.js   310.31 kB \u2502 gzip: 88.68 kB\r\n\r\n\u001B[32m\u2713 built in 411ms\u001B[39m\r\n",
+        "durationMs": 1691
+      },
+      {
+        "name": "lint-pass",
+        "kind": "process",
+        "verificationMethod": "exit-code",
+        "passed": true,
+        "timedOut": false,
+        "skipped": false,
+        "skippedReason": null,
+        "exitCode": 0,
+        "outputSample": "\r\n\u003E sistema-pedidos@0.0.0 lint\r\n\u003E oxlint\r\n\r\nsrc/App.jsx:68:7: warning eslint(no-unused-vars): Variable \u0027handleLogout\u0027 is declared but never used. Unused variables should start with a \u0027_\u0027. help: Consider removing this declaration.\r\nsrc/App.jsx:827:31: warning eslint(no-unused-vars): Parameter \u0027changeData\u0027 is declared but never used. Unused parameters should start with a \u0027_\u0027. help: Consider removing this parameter.\r\nsrc/App.jsx:256:6: warning react(preserve-manual-memoization): Existing memoization could not be preserved help: React Compiler has skipped optimizing this component because the existing manual memoization could not be preserved. The inferred dependencies did not match the manually specified dependencies, which could cause the value to change more or less frequently than expected. The inferred dependency was \u0060session\u0060, but the source dependencies were [session?.area]. Inferred less specific property than source\r\nsrc/App.jsx:185:5: warning react(set-state-in-effect): Calling setState synchronously within an effect can trigger cascading renders help: Effects should synchronize React with external systems. Calling setState synchronously inside an effect starts another render and is usually unnecessary. Derive the value during render, initialize state directly, or update it from the event that caused the change. Use an effect only when synchronizing with an external system.\r\nsrc/App.jsx:189:5: warning react(set-state-in-effect): Calling setState synchronously within an effect can trigger cascading renders help: Effects should synchronize React with external systems. Calling setState synchronously inside an effect starts another render and is usually unnecessary. Derive the value during render, initialize state directly, or update it from the event that caused the change. Use an effect only when synchronizing with an external system.\r\nsrc/App.jsx:231:5: warning react(set-state-in-effect): Calling setState synchronously within an effect can trigger cascading renders help: Effects should synchronize React with external systems. Calling setState synchronously inside an effect starts another render and is usually unnecessary. Derive the value during render, initialize state directly, or update it from the event that caused the change. Use an effect only when synchronizing with an external system.\r\nsrc/App.jsx:277:5: warning react(set-state-in-effect): Calling setState synchronously within an effect can trigger cascading renders help: Effects should synchronize React with external systems. Calling setState synchronously inside an effect starts another render and is usually unnecessary. Derive the value during render, initialize state directly, or update it from the event that caused the change. Use an effect only when synchronizing with an external system.\r\n",
+        "durationMs": 980
+      },
+      {
+        "name": "tests-pass",
+        "kind": "process",
+        "verificationMethod": "test-results",
+        "passed": false,
+        "timedOut": false,
+        "skipped": false,
+        "skippedReason": null,
+        "exitCode": 1,
+        "outputSample": "\r\n\u003E sistema-pedidos@0.0.0 test\r\n\u003E vitest run\r\n\r\n\r\n RUN  v5.1.0 C:/Users/Josue/Proyectos/React/sistema-pedidos\r\n\r\n \u276F src/store.test.js (0 test)\r\n\r\n\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF Failed Suites 1 \u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\r\n\r\n FAIL  src/store.test.js [ src/store.test.js ]\r\nTypeError: Cannot read properties of undefined (reading \u0027config\u0027)\r\n \u276F src/store.test.js:4:1\r\n      2| import { dateKey, normalizeSales } from \u0027./store\u0027\r\n      3|\r\n      4| describe(\u0027sales data from the API\u0027, () =\u003E {\r\n       | ^\r\n      5|   it(\u0027normalizes the backend date and Spanish field names\u0027, () =\u003E {\r\n      6|     const [sale] = normalizeSales([{\r\n\r\n\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF[1/1]\u23AF\r\n\r\n\r\n Test Files  1 failed (1)\r\n      Tests  no tests\r\n   Start at  14:13:59\r\n   Duration  470ms (worker 96%, environment 4%)\r\n\r\n",
+        "durationMs": 2088,
+        "testResults": {
+          "testFramework": "vitest",
+          "runnerDetectedFrom": "package_json",
+          "testsTotal": 0,
+          "testsPassed": 0,
+          "testsFailed": 0,
+          "testsSkipped": 0,
+          "parseFailed": true
+        }
+      },
+      {
+        "name": "dev-server-home",
+        "kind": "http-probe",
+        "verificationMethod": "http-status",
+        "passed": true,
+        "timedOut": false,
+        "skipped": false,
+        "skippedReason": null,
+        "exitCode": null,
+        "outputSample": "HTTP 200\n\u003C!doctype html\u003E\n\u003Chtml lang=\u0022es\u0022\u003E\n  \u003Chead\u003E\n    \u003Cscript type=\u0022module\u0022\u003Eimport { injectIntoGlobalHook } from \u0022/@react-refresh\u0022;\ninjectIntoGlobalHook(window);\nwindow.$RefreshReg$ = () =\u003E {};\nwindow.$RefreshSig$ = () =\u003E (type) =\u003E type;\u003C/script\u003E\n\n    \u003Cscript type=\u0022module\u0022 src=\u0022/@vite/client\u0022\u003E\u003C/script\u003E\n\n    \u003Cmeta charset=\u0022UTF-8\u0022 /\u003E\n    \u003Cmeta name=\u0022viewport\u0022 content=\u0022width=device-width, initial-scale=1.0\u0022 /\u003E\n    \u003Cmeta name=\u0022theme-color\u0022 content=\u0022#f7f7f3\u0022 /\u003E\n    \u003Cmeta name=\u0022description\u0022 content=\u0022Lumbre: men\u00FA digital, pedidos y operaci\u00F3n del restaurante.\u0022 /\u003E\n    \u003Ctitle\u003ELumbre | Restaurante\u003C/title\u003E\n  \u003C/head\u003E\n  \u003Cbody\u003E\n    \u003Cdiv id=\u0022root\u0022\u003E\u003C/div\u003E\n    \u003Cscript type=\u0022module\u0022 src=\u0022/src/main.jsx\u0022\u003E\u003C/script\u003E\n  \u003C/body\u003E\n\u003C/html\u003E\n",
+        "durationMs": 17
+      }
+    ],
+    "executions": [
+      {
+        "source": "production-build",
+        "resolvedExecutable": "C:\\Program Files\\nodejs\\npm.CMD",
+        "args": [
+          "run",
+          "build"
+        ],
+        "cwd": "c:\\Users\\Josue\\Proyectos\\React\\sistema-pedidos",
+        "env": {},
+        "prependPath": [],
+        "platform": "win32"
+      },
+      {
+        "source": "lint-pass",
+        "resolvedExecutable": "C:\\Program Files\\nodejs\\npm.CMD",
+        "args": [
+          "run",
+          "lint"
+        ],
+        "cwd": "c:\\Users\\Josue\\Proyectos\\React\\sistema-pedidos",
+        "env": {},
+        "prependPath": [],
+        "platform": "win32"
+      },
+      {
+        "source": "tests-pass",
+        "resolvedExecutable": "C:\\Program Files\\nodejs\\npm.CMD",
+        "args": [
+          "test"
+        ],
+        "cwd": "c:\\Users\\Josue\\Proyectos\\React\\sistema-pedidos",
+        "env": {},
+        "prependPath": [],
+        "platform": "win32"
+      },
+      {
+        "source": "dev-server-home",
+        "resolvedExecutable": "C:\\Program Files\\nodejs\\npm.CMD",
+        "args": [
+          "run",
+          "dev",
+          "--",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "5189"
+        ],
+        "cwd": "c:\\Users\\Josue\\Proyectos\\React\\sistema-pedidos",
+        "env": {},
+        "prependPath": [],
+        "platform": "win32"
+      }
+    ]
+  }
+}
