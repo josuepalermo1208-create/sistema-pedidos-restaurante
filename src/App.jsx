@@ -1,9 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  activeAccountRequests,
   dateKey,
   loadData,
   money,
+  normalizeOrders,
   normalizeSales,
+  reconcileAccountRequests,
+  salesForCashier,
+  shortTime,
   tableOrders,
   tableStatus,
   tableTotal,
@@ -88,12 +93,31 @@ function handleImageError(event) {
   event.currentTarget.src = fallbackFoodImage
 }
 
-function shortTime(value) {
-  return new Intl.DateTimeFormat('es-MX', { hour: '2-digit', minute: '2-digit' }).format(new Date(value))
-}
-
 function longDate(value = new Date()) {
   return new Intl.DateTimeFormat('es-MX', { weekday: 'long', day: 'numeric', month: 'long' }).format(value)
+}
+
+function getAccountTotal(data, tableId) {
+  const total = tableTotal(data, tableId)
+  const canCollect = Number.isFinite(total) && total > 0
+  return {
+    total,
+    canCollect,
+    label: canCollect ? money(total) : 'Importe no disponible',
+  }
+}
+
+function formatAccountItemTotal(item) {
+  const total = item.price * item.quantity
+  return Number.isFinite(total) ? money(total) : 'Importe no disponible'
+}
+
+async function closeApiSession() {
+  const response = await fetch('http://localhost:8080/SistemaPedidosBackend/api/auth/logout', {
+    method: 'POST',
+    credentials: 'include',
+  })
+  if (!response.ok) throw new Error('El servidor no confirmó el cierre de sesión.')
 }
 
 function App() {
@@ -101,6 +125,10 @@ function App() {
   const [kitchenOrders, setKitchenOrders] = useState([])
   const [session, setSession] = useState(null)
   const [pathname, setPathname] = useState(() => window.location.pathname.replace(/\/+$/, '') || '/')
+  const sessionRef = useRef(session)
+  const pathnameRef = useRef(pathname)
+  const logoutRef = useRef(null)
+  const ordersLoadedRef = useRef(false)
   const [section, setSection] = useState('menu')
   const [tableId, setTableId] = useState('4')
   const [category, setCategory] = useState('Todos')
@@ -116,17 +144,27 @@ function App() {
   const [saleDate, setSaleDate] = useState(todayKey())
   const [logType, setLogType] = useState('Todos')
   const fileInput = useRef(null)
+  const refreshInProgress = useRef(false)
 
   useEffect(() => {
-    const syncPathname = () => setPathname(window.location.pathname.replace(/\/+$/, '') || '/')
+    const syncPathname = () => {
+      const nextPathname = window.location.pathname.replace(/\/+$/, '') || '/'
+      const pathChanged = nextPathname !== pathnameRef.current
+      pathnameRef.current = nextPathname
+      setPathname(nextPathname)
+      if (pathChanged && sessionRef.current) logoutRef.current?.(false)
+    }
     window.addEventListener('popstate', syncPathname)
     return () => window.removeEventListener('popstate', syncPathname)
   }, [])
 
-  const navigate = (path) => {
-    window.history.pushState({}, '', path)
-    setPathname(path)
-  }
+  const navigate = useCallback((path) => {
+    const nextPathname = path.replace(/\/+$/, '') || '/'
+    if (nextPathname !== pathnameRef.current && sessionRef.current) logoutRef.current?.(false)
+    window.history.pushState({}, '', nextPathname)
+    pathnameRef.current = nextPathname
+    setPathname(nextPathname)
+  }, [])
 
   const loadApiUsers = useCallback(async () => {
     const response = await fetch('http://localhost:8080/SistemaPedidosBackend/api/usuarios', {
@@ -134,7 +172,7 @@ function App() {
     })
     if (!response.ok) throw new Error('No fue posible consultar los usuarios')
     const users = await response.json()
-    const apiUsers = Array.isArray(users) ? users : []
+    const apiUsers = Array.isArray(users) ? users : (users.value || users.users || [])
     setData((currentData) => ({ ...currentData, users: apiUsers }))
     return apiUsers
   }, [])
@@ -145,9 +183,48 @@ function App() {
     })
     if (!response.ok) throw new Error('No fue posible consultar las mesas')
     const tables = await response.json()
-    const apiTables = Array.isArray(tables) ? tables : []
-    setData((currentData) => ({ ...currentData, tables: apiTables }))
+    const apiTables = Array.isArray(tables) ? tables : (tables.value || tables.tables || [])
+    setData((currentData) => {
+      const nextData = { ...currentData, tables: apiTables }
+      return ordersLoadedRef.current ? reconcileAccountRequests(nextData) : nextData
+    })
     return apiTables
+  }, [])
+
+  const loadApiAccountRequests = useCallback(async (tables) => {
+    const activeTables = tables.filter((table) => table.active !== false && (table.id ?? table.mesaId) != null)
+    const results = await Promise.allSettled(activeTables.map(async (table) => {
+      const tableId = String(table.id ?? table.mesaId)
+      const response = await fetch(`http://localhost:8080/SistemaPedidosBackend/api/mesas/${encodeURIComponent(tableId)}/cuenta`, {
+        credentials: 'include',
+      })
+      if (response.status === 404) return null
+      if (!response.ok) throw new Error(`No fue posible consultar la cuenta de la mesa ${tableId}`)
+      const account = await response.json()
+      if (!account || typeof account !== 'object') return null
+      return [tableId, account]
+    }))
+    const accounts = []
+    results.forEach((result) => {
+      if (result.status === 'fulfilled') {
+        if (result.value) accounts.push(result.value)
+      } else {
+        console.error('Error obteniendo las solicitudes de cuenta:', result.reason)
+      }
+    })
+    setData((currentData) => {
+      const nextAccounts = { ...currentData.accounts }
+      accounts.forEach(([tableId, account]) => {
+        const currentAccount = nextAccounts[tableId] || {}
+        nextAccounts[tableId] = {
+          ...currentAccount,
+          ...account,
+          attendedBy: currentAccount.attendedBy ?? account.attendedBy ?? null,
+          attendedAt: currentAccount.attendedAt ?? account.attendedAt ?? null,
+        }
+      })
+      return reconcileAccountRequests({ ...currentData, accounts: nextAccounts })
+    })
   }, [])
 
   const loadApiMenu = useCallback(async () => {
@@ -182,13 +259,15 @@ function App() {
     const response = await fetch(url, { credentials: 'include' })
     if (!response.ok) throw new Error('No fue posible consultar los pedidos')
     const orders = await response.json()
-    const apiOrders = Array.isArray(orders) ? orders : []
+    const rawOrders = Array.isArray(orders) ? orders : (orders.value || orders.items || orders.pedidos || [])
+    const apiOrders = normalizeOrders(rawOrders)
     const filteredOrders = apiOrders.filter((order) => (
       (!filters.area || order.area === filters.area)
       && (!filters.estado || order.status === filters.estado || order.estado === filters.estado)
       && (!filters.mesaId || String(order.tableId) === String(filters.mesaId))
     ))
-    setData((currentData) => ({ ...currentData, orders: filteredOrders }))
+    ordersLoadedRef.current = true
+    setData((currentData) => reconcileAccountRequests({ ...currentData, orders: filteredOrders }))
     return apiOrders
   }, [])
 
@@ -197,19 +276,13 @@ function App() {
   }, [loadApiUsers])
 
   useEffect(() => {
-    loadApiTables().catch((error) => console.error('Error obteniendo las mesas:', error))
-    loadApiOrders().catch((error) => console.error('Error obteniendo los pedidos:', error))
-    loadApiSales().catch((error) => console.error('Error obteniendo las ventas:', error))
-  }, [loadApiTables, loadApiOrders, loadApiSales])
-
-  useEffect(() => {
     fetch(`http://localhost:8080/SistemaPedidosBackend/api/mesas/${encodeURIComponent(tableId)}/cuenta`, {
       credentials: 'include',
     })
       .then((response) => response.ok ? response.json() : null)
       .then((account) => {
         if (!account) return
-        setData((currentData) => ({
+        setData((currentData) => reconcileAccountRequests({
           ...currentData,
           accounts: { ...currentData.accounts, [tableId]: { ...currentData.accounts[tableId], ...account } },
         }))
@@ -225,16 +298,44 @@ function App() {
         if (!response.ok) return null
         const sessionData = await response.json()
         if (!sessionData.user) return null
+        if ((window.location.pathname.replace(/\/+$/, '') || '/') !== '/personal') {
+          try {
+            await closeApiSession()
+          } catch (error) {
+            console.error('Error cerrando la sesión al entrar a otra ruta:', error)
+          }
+          return null
+        }
         const users = await loadApiUsers()
         const apiUser = users.find((candidate) => candidate.id === sessionData.user.id)
-        return apiUser ? { ...sessionData.user, ...apiUser } : sessionData.user
+        const currentUser = apiUser ? { ...sessionData.user, ...apiUser } : sessionData.user
+        return {
+          ...currentUser,
+          name: currentUser.name || currentUser.username || 'Personal',
+          role: roles[currentUser.role] ? currentUser.role : null,
+        }
       })
-      .then((currentSession) => {
-        if (!currentSession) return
+      .then(async (currentSession) => {
+        if (!currentSession?.role) return
+        if ((window.location.pathname.replace(/\/+$/, '') || '/') !== '/personal') {
+          try {
+            await closeApiSession()
+          } catch (error) {
+            console.error('Error cerrando la sesión al entrar a otra ruta:', error)
+          }
+          return
+        }
+        sessionRef.current = currentSession
         setSession(currentSession)
         setSection('overview')
       })
-      .catch((error) => console.error('Error comprobando la sesión:', error))
+      .catch((error) => {
+        if (pathnameRef.current !== '/personal') {
+          closeApiSession().catch((logoutError) => console.error('Error cerrando la sesión al entrar a otra ruta:', logoutError))
+          return
+        }
+        console.error('Error comprobando la sesión:', error)
+      })
   }, [loadApiUsers])
 
   useEffect(() => {
@@ -256,10 +357,11 @@ function App() {
       const response = await fetch(`http://localhost:8080/SistemaPedidosBackend/api/pedidos?area=${encodeURIComponent(session?.area || '')}`, { credentials: 'include' })
       if (!response.ok) throw new Error('No fue posible consultar los pedidos de cocina')
       const orders = await response.json()
-      const pendingOrders = Array.isArray(orders) ? orders : (orders.value || orders.pedidos || [])
+      const rawOrders = Array.isArray(orders) ? orders : (orders.value || orders.items || orders.pedidos || [])
+      const pendingOrders = normalizeOrders(rawOrders)
       setKitchenOrders(pendingOrders.filter((order) =>
         !order.paid
-        && (order.status === 'Pendiente' || order.status === 'En preparación')
+        && (order.status === 'Pendiente' || order.status === 'En preparación' || order.status === 'Listo')
         && (!order.area || order.area === session?.area)
       ))
     } catch (error) {
@@ -276,20 +378,54 @@ function App() {
         body: JSON.stringify({ estado: status }),
       })
       if (!response.ok) throw new Error('No fue posible actualizar el pedido')
-      await loadKitchenOrders()
-      notify(status === 'Listo' ? 'Pedido listo. Servicio ya puede entregarlo.' : 'Pedido en preparación.')
+      const refreshTasks = [loadApiOrders(), loadApiTables()]
+      if (session?.role === 'cocinero') refreshTasks.push(loadKitchenOrders())
+      await Promise.all(refreshTasks)
+      notify(status === 'Listo'
+        ? 'Pedido listo. Servicio ya puede entregarlo.'
+        : status === 'Servido'
+          ? 'Entrega confirmada.'
+          : 'Pedido en preparación.')
     } catch (error) {
-      console.error('Error actualizando el pedido de cocina:', error)
+      console.error('Error actualizando el estado del pedido:', error)
       notify('No se pudo actualizar el pedido.', 'error')
     }
   }
 
+  const refreshApiData = useCallback(async () => {
+    if (document.visibilityState !== 'visible' || refreshInProgress.current) return
+    refreshInProgress.current = true
+    const refreshTasks = [
+      loadApiTables(),
+      loadApiOrders(),
+      loadApiSales(),
+      loadApiMenu(),
+    ]
+    if (session?.role === 'cocinero') refreshTasks.push(loadKitchenOrders())
+    const results = await Promise.allSettled(refreshTasks)
+    results.forEach((result) => {
+      if (result.status === 'rejected') console.error('Error actualizando datos desde la API:', result.reason)
+    })
+    if (['mesero', 'cajero'].includes(session?.role) && results[0]?.status === 'fulfilled') {
+      await loadApiAccountRequests(results[0].value)
+    }
+    refreshInProgress.current = false
+  }, [loadApiTables, loadApiOrders, loadApiSales, loadApiMenu, loadApiAccountRequests, loadKitchenOrders, session?.role])
+
   useEffect(() => {
-    if (session?.role !== 'cocinero') return undefined
-    loadKitchenOrders()
-    const interval = window.setInterval(loadKitchenOrders, 5000)
-    return () => window.clearInterval(interval)
-  }, [session?.role, loadKitchenOrders])
+    refreshApiData()
+    const interval = window.setInterval(refreshApiData, 5000)
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') refreshApiData()
+    }
+    document.addEventListener('visibilitychange', refreshWhenVisible)
+    window.addEventListener('focus', refreshApiData)
+    return () => {
+      window.clearInterval(interval)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+      window.removeEventListener('focus', refreshApiData)
+    }
+  }, [refreshApiData])
 
   const changeData = (mutate, type, description) => {
     setData((current) => withEvent(mutate(current), type, actor, description))
@@ -311,7 +447,18 @@ function App() {
       if (!response.ok) throw new Error('Usuario o contraseña incorrectos.')
       const loginData = await response.json()
       const users = await loadApiUsers()
-      const user = users.find((candidate) => candidate.id === loginData.user?.id) || loginData.user
+      const apiUser = users.find((candidate) => candidate.id === loginData.user?.id)
+      const loggedInUser = apiUser ? { ...loginData.user, ...apiUser } : loginData.user
+      const user = {
+        ...loggedInUser,
+        name: loggedInUser?.name || loggedInUser?.username || credentials.username.trim(),
+        role: roles[loggedInUser?.role] ? loggedInUser.role : credentials.role,
+      }
+      if (pathnameRef.current !== '/personal') {
+        await closeApiSession()
+        return
+      }
+      sessionRef.current = user
       setSession(user)
       setSection('overview')
       notify(`Bienvenido/a, ${user.name}.`)
@@ -321,22 +468,24 @@ function App() {
     }
   }
 
-  const logout = async () => {
+  const logout = useCallback(async (redirectToPersonal = true) => {
+    const activeSession = sessionRef.current
+    sessionRef.current = null
+    setSession(null)
+    setData((current) => withEvent(current, 'Acceso', activeSession?.name || 'Comensal', 'Cierre de sesión.'))
+    setSection('menu')
+    setCart({})
+    if (redirectToPersonal) navigate('/personal')
     try {
-      await fetch('http://localhost:8080/SistemaPedidosBackend/api/auth/logout', {
-        method: 'POST',
-        credentials: 'include',
-      })
+      await closeApiSession()
     } catch (error) {
       console.error('Error cerrando la sesión:', error)
     }
-    setData((current) => withEvent(current, 'Acceso', actor, 'Cierre de sesión.'))
-    setSession(null)
-    setSection('menu')
-    setCart({})
-    navigate('/personal')
-    notify('Sesión cerrada correctamente.')
-  }
+    if (redirectToPersonal) notify('Sesión cerrada correctamente.')
+  }, [navigate, notify])
+  useEffect(() => {
+    logoutRef.current = logout
+  }, [logout])
 
   const authorizeTableChange = async (credentials) => {
     const username = credentials.username.trim().toLowerCase()
@@ -412,7 +561,7 @@ function App() {
       return
     }
 
-    if (data.accounts[tableId]?.requested) {
+    if (data.accounts[tableId]?.requested && tableOrders(data, tableId).length) {
       notify('Tu cuenta ya fue solicitada. Pide apoyo al personal para agregar algo más.', 'error')
       return
     }
@@ -531,8 +680,8 @@ function App() {
       {session ? (
         <aside className="sidebar">
           <a className="brand" href="#inicio" onClick={(event) => { event.preventDefault(); setSection('overview') }}>
-            <span className="brand-mark">L</span>
-            <span className="brand-copy"><strong>lumbre</strong><small>RESTAURANTE</small></span>
+            <span className="brand-mark">S</span>
+            <span className="brand-copy"><strong>SaborMX</strong><small>CADENA DE RESTAURANTES</small></span>
           </a>
           <div className="workspace-label">ESPACIO DE TRABAJO</div>
           <div className="staff-profile">
@@ -544,14 +693,14 @@ function App() {
             {currentNav.map(([id, label, number]) => (
               <button className={`nav-item ${section === id ? 'selected' : ''}`} key={id} onClick={() => setSection(id)}>
                 <span className="nav-number">{number}</span><span>{label}</span>
-                {id === 'accounts' && data.accounts && Object.values(data.accounts).filter((account) => account.requested).length > 0 && session.role !== 'cajero' ? <span className="nav-alert" /> : null}
+                {id === 'accounts' && activeAccountRequests(data).length > 0 && session.role !== 'cajero' ? <span className="nav-alert" /> : null}
               </button>
             ))}
           </nav>
           <div className="sidebar-bottom">
             <div className="service-status"><span className="online-dot" /><span>Servicio operativo</span></div>
             <button className="nav-item guest-link" onClick={logout}><span className="nav-number">↗</span><span>Cerrar sesión</span></button>
-            <div className="sidebar-footer">Lumbre POS <span>v1.0</span></div>
+            <div className="sidebar-footer">SaborMX POS <span>v1.0</span></div>
           </div>
         </aside>
       ) : null}
@@ -561,7 +710,7 @@ function App() {
           {!session ? (
             <>
               <a className="brand guest-brand" href="#inicio" onClick={(event) => { event.preventDefault(); setSection('menu') }}>
-                <span className="brand-mark">L</span><span className="brand-copy"><strong>lumbre</strong><small>COCINA DE TEMPORADA</small></span>
+                <span className="brand-mark">S</span><span className="brand-copy"><strong>SaborMX</strong><small>CADENA DE RESTAURANTES</small></span>
               </a>
               <div className="guest-top-actions">
                 <label className="table-picker"><span>MESA</span>
@@ -574,8 +723,8 @@ function App() {
             </>
           ) : (
             <>
-              <div className="breadcrumb"><span>RESTAURANTE LUMBRE</span><span className="breadcrumb-divider">/</span><strong>{currentNav.find(([id]) => id === section)?.[1] || roles[session.role]?.title}</strong></div>
-              <div className="topbar-right"><span className="date-label">{longDate()}</span><button className="top-avatar" aria-label="Cerrar sesión" title="Cerrar sesión" onClick={logout}>{displayName.split(' ').map((part) => part[0]).slice(0, 2).join('')}</button></div>
+              <div className="breadcrumb"><span>CADENA SABORMX</span><span className="breadcrumb-divider">/</span><strong>{currentNav.find(([id]) => id === section)?.[1] || roles[session.role]?.title}</strong></div>
+              <div className="topbar-right"><span className="date-label">{longDate()}</span><button className="top-avatar" aria-label="Cerrar sesión" title="Cerrar sesión">{displayName.split(' ').map((part) => part[0]).slice(0, 2).join('')}</button></div>
             </>
           )}
         </header>
@@ -633,11 +782,11 @@ function App() {
           {session?.role === 'cocinero' && section === 'served' ? <CookHistory data={data} session={session} /> : null}
           {session?.role === 'mesero' && section === 'overview' ? <WaiterOverview data={data} setSection={setSection} /> : null}
           {session?.role === 'mesero' && section === 'tables' ? <WaiterTables data={data} /> : null}
-          {session?.role === 'mesero' && section === 'ready' ? <ReadyOrders data={data} changeData={changeData} notify={notify} /> : null}
+          {session?.role === 'mesero' && section === 'ready' ? <ReadyOrders data={data} updateOrderStatus={updateKitchenOrder} /> : null}
           {session?.role === 'mesero' && section === 'accounts' ? <WaiterAccounts data={data} changeData={changeData} notify={notify} actor={actor} /> : null}
           {session?.role === 'cajero' && section === 'overview' ? <CashierOverview data={data} setSection={setSection} onCollect={(id) => { setPayment(id); setPaymentMethod(data.accounts[id]?.method || 'Efectivo'); setCashReceived('') }} /> : null}
           {session?.role === 'cajero' && section === 'accounts' ? <CashierAccounts data={data} onCollect={(id) => { setPayment(id); setPaymentMethod(data.accounts[id]?.method || 'Efectivo'); setCashReceived('') }} /> : null}
-          {session?.role === 'cajero' && section === 'sales' ? <CashierSales data={data} date={saleDate} setDate={setSaleDate} session={session} /> : null}
+          {session?.role === 'cajero' && section === 'sales' ? <CashierSales data={data} date={saleDate} setDate={setSaleDate} session={session} notify={notify} /> : null}
           {session?.role === 'adminred' && section === 'overview' ? <NetworkOverview data={data} setSection={setSection} /> : null}
           {session?.role === 'adminred' && section === 'monitor' ? <NetworkMonitor data={data} /> : null}
           {session?.role === 'adminred' && section === 'devices' ? <NetworkDevices data={data} changeData={changeData} notify={notify} /> : null}
@@ -767,7 +916,7 @@ function LoginModal({ onLogin, onClose, standalone = false }) {
   const content = (
     <div className="modal login-modal">
       {!standalone ? <button className="modal-close" onClick={onClose} aria-label="Cerrar">×</button> : null}
-      <div className="login-brand"><span className="brand-mark">L</span><span className="eyebrow">SISTEMA DE OPERACIÓN</span></div>
+      <div className="login-brand"><span className="brand-mark">S</span><span className="eyebrow">SISTEMA DE OPERACIÓN</span></div>
       <h2>Bienvenido al equipo.</h2>
       <p className="login-intro">Ingresa con las credenciales asignadas por gerencia.</p>
       <form onSubmit={(event) => onLogin(event, { role, username, password })}>
@@ -782,7 +931,7 @@ function LoginModal({ onLogin, onClose, standalone = false }) {
 
   return standalone ? (
     <main className="staff-login-page">
-      <a className="staff-login-back" href="/" onClick={(event) => { event.preventDefault(); onClose() }}>← Volver a la mesa</a>
+      {/* <a className="staff-login-back" href="/" onClick={(event) => { event.preventDefault(); onClose() }}>← Volver a la mesa</a> */}
       {content}
     </main>
   ) : (
@@ -801,7 +950,7 @@ function TableChangeAuthorization({ nextTableId, onAuthorize, onClose }) {
         <button className="modal-close" onClick={onClose} aria-label="Cerrar">×</button>
         <p className="eyebrow">AUTORIZACIÓN DEL PERSONAL</p>
         <h2>Cambiar a la mesa {String(nextTableId).padStart(2, '0')}</h2>
-        <p className="login-intro">Ingresa las credenciales de un gerente o mesero activo.</p>
+        <p className="login-intro">Ingresa las credenciales de un personal autorizado.</p>
         <form onSubmit={(event) => { event.preventDefault(); onAuthorize({ username, password }) }}>
           <label className="form-field">Usuario del personal<input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required /></label>
           <label className="form-field">Contraseña<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
@@ -816,11 +965,11 @@ function TableChangeAuthorization({ nextTableId, onAuthorize, onClose }) {
 }
 
 function ManagerOverview({ data, setSection }) {
-  const requested = Object.entries(data.accounts).filter(([, account]) => account.requested)
+  const requested = activeAccountRequests(data)
   const occupied = data.tables.filter((table) => table.active && tableStatus(data, table.id) !== 'Libre').length
   const todaySales = data.sales.filter((sale) => dateKey(sale.paidAt) === todayKey())
   const pending = data.orders.filter((order) => !order.paid && order.status !== 'Servido')
-  return <><PageHeading eyebrow="MIÉRCOLES · OPERACIÓN DEL RESTAURANTE" title="Buenos días, Mariana." description="Aquí tienes el pulso de Lumbre para hoy." action={<span className="live-pill"><span /> OPERACIÓN EN VIVO</span>} /><div className="stats-grid"><StatCard label="MESAS EN SERVICIO" value={`${occupied} / ${data.tables.filter((table) => table.active).length}`} note="Mesas con cuenta abierta" accent /><StatCard label="PEDIDOS ACTIVOS" value={pending.length} note="En cocina, barra y para servir" /><StatCard label="CUENTAS SOLICITADAS" value={requested.length} note={requested.length ? 'Requieren atención del equipo' : 'Todo al día'} /><StatCard label="VENTA DE HOY" value={money(todaySales.reduce((sum, sale) => sum + sale.total, 0))} note={`${todaySales.length} cuentas pagadas`} /></div>
+  return <><PageHeading eyebrow="MIÉRCOLES · OPERACIÓN DEL RESTAURANTE" title="Buenos días, Mariana." description="Aquí tienes el pulso de SaborMX para hoy." action={<span className="live-pill"><span /> OPERACIÓN EN VIVO</span>} /><div className="stats-grid"><StatCard label="MESAS EN SERVICIO" value={`${occupied} / ${data.tables.filter((table) => table.active).length}`} note="Mesas con cuenta abierta" accent /><StatCard label="PEDIDOS ACTIVOS" value={pending.length} note="En cocina, barra y para servir" /><StatCard label="CUENTAS SOLICITADAS" value={requested.length} note={requested.length ? 'Requieren atención del equipo' : 'Todo al día'} /><StatCard label="VENTA DE HOY" value={money(todaySales.reduce((sum, sale) => sum + sale.total, 0))} note={`${todaySales.length} cuentas pagadas`} /></div>
     <div className="dashboard-grid"><section className="panel"><PanelHeading title="Pedidos en curso" link="Ver todos" onClick={() => setSection('orders')} /><OrderTable orders={pending.slice(0, 5)} tables={data.tables} /></section><section className="panel"><PanelHeading title="Atención pendiente" link="Ver solicitudes" onClick={() => setSection('orders')} />{requested.length ? requested.slice(0, 4).map(([id, account]) => <div className="attention-row" key={id}><span className="table-chip">M{id.padStart(2, '0')}</span><div><strong>Mesa {id.padStart(2, '0')}</strong><small>{shortTime(account.requestedAt)} · {account.method}</small></div><strong>{money(tableTotal(data, id))}</strong></div>) : <EmptyState title="Todo está en orden" description="Las solicitudes de cuenta aparecerán aquí." />}</section></div>
     <div className="quick-actions"><div><p className="eyebrow">ACCESOS RÁPIDOS</p><h2>¿Qué quieres hacer?</h2></div><div className="quick-action-list"><button onClick={() => setSection('menu')}><span>01</span>Administrar menú <b>→</b></button><button onClick={() => setSection('tables')}><span>02</span>Configurar mesas <b>→</b></button><button onClick={() => setSection('reports')}><span>03</span>Ver reportes <b>→</b></button></div></div>
   </>
@@ -843,7 +992,7 @@ function StatusBadge({ status }) {
 function ManagerMenu({ data, changeData, notify, setModal }) {
   const [filter, setFilter] = useState('Todos')
   const products = data.products.filter((product) => filter === 'Todos' || (filter === 'Activos' ? product.active : !product.active))
-  return <><PageHeading eyebrow="ADMINISTRACIÓN DEL RESTAURANTE" title="Menú" description="Mantén al día los productos que se sirven en Lumbre." action={<button className="button button-dark" onClick={() => setModal({ type: 'product', product: null })}>＋ Agregar producto</button>} /><div className="list-toolbar"><div className="filter-pills">{['Todos', 'Activos', 'Inactivos'].map((item) => <button key={item} className={filter === item ? 'filter-active' : ''} onClick={() => setFilter(item)}>{item}</button>)}</div><span>{products.length} productos</span></div>
+  return <><PageHeading eyebrow="ADMINISTRACIÓN DEL RESTAURANTE" title="Menú" description="Mantén al día los productos que se sirven en SaborMX." action={<button className="button button-dark" onClick={() => setModal({ type: 'product', product: null })}>＋ Agregar producto</button>} /><div className="list-toolbar"><div className="filter-pills">{['Todos', 'Activos', 'Inactivos'].map((item) => <button key={item} className={filter === item ? 'filter-active' : ''} onClick={() => setFilter(item)}>{item}</button>)}</div><span>{products.length} productos</span></div>
     <div className="admin-product-list">{products.map((product) => <article className={`admin-product-row ${!product.active ? 'product-disabled' : ''}`} key={product.id}><img src={product.image || fallbackFoodImage} onError={handleImageError} alt="" /><div className="admin-product-main"><strong>{product.name}</strong><span>{product.category} · {product.area === 'barra' ? 'Barra' : 'Cocina'}</span><small>{product.description || 'Sin descripción'}</small></div><strong className="admin-product-price">{money(product.price)}</strong><StatusBadge status={product.active ? 'Activo' : 'Inactivo'} /><button className="row-action" onClick={() => setModal({ type: 'product', product })}>Editar</button><button className="row-action" onClick={() => { changeData((current) => ({ ...current, products: current.products.map((item) => item.id === product.id ? { ...item, active: !item.active } : item) }), 'Menú', `${product.active ? 'Producto desactivado' : 'Producto activado'}: ${product.name}.`); notify(product.active ? 'Producto desactivado.' : 'Producto activado.') }}>{product.active ? 'Desactivar' : 'Activar'}</button></article>)}</div>
   </>
 }
@@ -923,7 +1072,7 @@ function CookHistory({ data, session }) {
 
 function WaiterOverview({ data, setSection }) {
   const waiting = data.orders.filter((order) => !order.paid && order.status === 'Listo')
-  const requested = Object.entries(data.accounts).filter(([, account]) => account.requested && !account.attendedBy)
+  const requested = activeAccountRequests(data).filter(([, account]) => !account.attendedBy)
   const occupied = data.tables.filter((table) => table.active && tableStatus(data, table.id) !== 'Libre').length
   return <><PageHeading eyebrow="SERVICIO DE MESA" title="Tu turno, en orden." description="Consulta las mesas y atiende lo que necesita cada una." action={<span className="live-pill"><span /> ACTUALIZACIÓN AUTOMÁTICA</span>} /><div className="stats-grid"><StatCard label="MESAS OCUPADAS" value={occupied} note="Con pedidos activos" accent /><StatCard label="PEDIDOS LISTOS" value={waiting.length} note="Para llevar a la mesa" /><StatCard label="CUENTAS POR ATENDER" value={requested.length} note="Solicitudes nuevas" /></div><div className="dashboard-grid"><section className="panel"><PanelHeading title="Pedidos listos para servir" link="Ir a pedidos" onClick={() => setSection('ready')} />{waiting.slice(0, 4).map((order) => <div className="attention-row" key={order.id}><span className="table-chip">M{order.tableId.padStart(2, '0')}</span><div><strong>{order.id}</strong><small>{order.items.reduce((sum, item) => sum + item.quantity, 0)} productos · listo {shortTime(order.readyAt || order.createdAt)}</small></div><StatusBadge status="Listo" /></div>)}{!waiting.length ? <EmptyState title="No hay pedidos listos para servir" /> : null}</section><section className="panel"><PanelHeading title="Solicitudes de cuenta" link="Ver solicitudes" onClick={() => setSection('accounts')} />{requested.slice(0, 4).map(([id, account]) => <div className="attention-row" key={id}><span className="table-chip">M{id.padStart(2, '0')}</span><div><strong>Mesa {id.padStart(2, '0')}</strong><small>{shortTime(account.requestedAt)} · {account.method}</small></div><strong>{money(tableTotal(data, id))}</strong></div>)}{!requested.length ? <EmptyState title="No hay cuentas solicitadas" /> : null}</section></div></>
 }
@@ -934,32 +1083,44 @@ function WaiterTables({ data }) {
   return <><PageHeading eyebrow="SERVICIO DE MESA" title="Estado de mesas" description="Consulta la ocupación, el consumo y los pedidos listos para entregar." action={<span className="live-pill"><span /> ACTUALIZADO AHORA</span>} /><div className="list-toolbar"><div className="filter-pills">{['Todas', 'Libre', 'Ocupada', 'Cuenta solicitada'].map((item) => <button className={filter === item ? 'filter-active' : ''} key={item} onClick={() => setFilter(item)}>{item}</button>)}</div><span>{tables.length} mesas</span></div><div className="table-cards">{tables.map((table) => { const status = tableStatus(data, table.id); const readyCount = data.orders.filter((order) => order.tableId === table.id && !order.paid && order.status === 'Listo').length; return <article className={`table-card ${status === 'Libre' ? '' : 'table-card-busy'}`} key={table.id}><div className="table-card-top"><span className="table-chip">M{table.name}</span><StatusBadge status={status} /></div><div className="table-number">{table.name}</div><span className="table-capacity">Capacidad {table.capacity} personas</span><div className="table-card-bottom"><span>{money(tableTotal(data, table.id))}</span>{readyCount ? <span className="ready-count">{readyCount} listo{readyCount > 1 ? 's' : ''} para servir</span> : <span>{readyCount === 0 ? 'Sin pedidos listos' : ''}</span>}</div></article> })}</div>{tables.length === 0 ? <EmptyState title="No hay mesas en este estado" /> : null}</>
 }
 
-function ReadyOrders({ data, changeData, notify }) {
+function ReadyOrders({ data, updateOrderStatus }) {
   const orders = data.orders.filter((order) => !order.paid && order.status === 'Listo').sort((a, b) => new Date(a.readyAt || a.createdAt) - new Date(b.readyAt || b.createdAt))
-  return <><PageHeading eyebrow="SERVICIO DE MESA" title="Listos para servir" description="Confirma la entrega cuando cada pedido llegue a su mesa." action={<span className="live-pill"><span /> EN VIVO</span>} />{orders.length ? <div className="ready-order-list">{orders.map((order) => <article className="ready-order-card" key={order.id}><div className="ready-order-header"><span className="table-chip">M{order.tableId.padStart(2, '0')}</span><div><strong>{order.id}</strong><small>Listo a las {shortTime(order.readyAt || order.createdAt)}</small></div><StatusBadge status="Listo" /></div><div className="ready-items">{order.items.map((item) => <span key={item.productId}>{item.quantity} × {item.name}</span>)}</div><button className="button button-dark" onClick={() => { changeData((current) => ({ ...current, orders: current.orders.map((item) => item.id === order.id ? { ...item, status: 'Servido', servedAt: new Date().toISOString() } : item) }), 'Servicio', `${order.id} entregado en la mesa ${order.tableId.padStart(2, '0')}.`); notify('El pedido se marcó como servido.') }}>Confirmar entrega <span>→</span></button></article>)}</div> : <EmptyState title="No hay pedidos listos para servir" description="Cuando cocina o barra termine una comanda, aparecerá aquí." />}</>
+  return <><PageHeading eyebrow="SERVICIO DE MESA" title="Listos para servir" description="Confirma la entrega cuando cada pedido llegue a su mesa." action={<span className="live-pill"><span /> EN VIVO</span>} />{orders.length ? <div className="ready-order-list">{orders.map((order) => <article className="ready-order-card" key={order.id}><div className="ready-order-header"><span className="table-chip">M{order.tableId.padStart(2, '0')}</span><div><strong>{order.id}</strong><small>Listo a las {shortTime(order.readyAt || order.createdAt)}</small></div><StatusBadge status="Listo" /></div><div className="ready-items">{order.items.map((item) => <span key={item.productId}>{item.quantity} × {item.name}</span>)}</div><button className="button button-dark" onClick={() => updateOrderStatus(order.id, 'Servido')}>Confirmar entrega <span>→</span></button></article>)}</div> : <EmptyState title="No hay pedidos listos para servir" description="Cuando cocina o barra termine una comanda, aparecerá aquí." />}</>
 }
 
 function WaiterAccounts({ data, changeData, notify, actor }) {
-  const requests = Object.entries(data.accounts).filter(([, account]) => account.requested).sort((a, b) => new Date(a[1].requestedAt) - new Date(b[1].requestedAt))
+  const requests = activeAccountRequests(data).sort((a, b) => new Date(a[1].requestedAt) - new Date(b[1].requestedAt))
   return <><PageHeading eyebrow="SERVICIO DE MESA" title="Solicitudes de cuenta" description="Confirma que ya estás atendiendo la mesa para habilitar el cobro." action={<span className="live-pill"><span /> EN VIVO</span>} />{requests.length ? <div className="account-request-list">{requests.map(([id, account]) => <article className="account-request-card" key={id}><div className="account-request-top"><span className="table-chip">M{id.padStart(2, '0')}</span><StatusBadge status={account.attendedBy ? 'Atendida' : 'Nueva'} /></div><h2>Mesa {id.padStart(2, '0')}</h2><div className="account-request-facts"><div><span>TOTAL</span><strong>{money(tableTotal(data, id))}</strong></div><div><span>MÉTODO ELEGIDO</span><strong>{account.method}</strong></div><div><span>SOLICITADA</span><strong>{shortTime(account.requestedAt)}</strong></div></div>{account.attendedBy ? <div className="account-requested"><span>✓</span><div><strong>Atendida por {account.attendedBy}</strong><p>La cuenta está disponible para el cajero.</p></div></div> : <button className="button button-dark button-wide" onClick={() => { changeData((current) => ({ ...current, accounts: { ...current.accounts, [id]: { ...current.accounts[id], attendedBy: actor, attendedAt: new Date().toISOString() } } }), 'Servicio', `Solicitud de cuenta de la mesa ${id.padStart(2, '0')} atendida por ${actor}.`); notify('Solicitud de cuenta atendida.') }}>Confirmar que la estoy atendiendo <span>→</span></button>}</article>)}</div> : <EmptyState title="No hay cuentas solicitadas" description="Cuando una mesa pida su cuenta, aparecerá aquí." />}</>
 }
 
 function CashierOverview({ data, setSection, onCollect }) {
-  const requests = Object.entries(data.accounts).filter(([, account]) => account.requested && account.attendedBy)
+  const requests = activeAccountRequests(data).filter(([, account]) => account.attendedBy)
+  const nextRequest = requests[0]
+  const nextTotal = nextRequest ? getAccountTotal(data, nextRequest[0]) : null
   const todaySales = data.sales.filter((sale) => dateKey(sale.paidAt) === todayKey())
-  return <><PageHeading eyebrow="PUNTO DE VENTA" title="Caja" description="Cobra las cuentas pendientes y revisa el corte de tu turno." action={<span className="live-pill"><span /> CAJA ABIERTA</span>} /><div className="stats-grid"><StatCard label="POR COBRAR" value={requests.length} note="Cuentas solicitadas" accent /><StatCard label="VENTA DE HOY" value={money(todaySales.reduce((sum, sale) => sum + sale.total, 0))} note={`${todaySales.length} cuentas pagadas`} /><StatCard label="EFECTIVO" value={money(todaySales.filter((sale) => sale.method === 'Efectivo').reduce((sum, sale) => sum + sale.total, 0))} note="Cobros en efectivo" /><StatCard label="TARJETA" value={money(todaySales.filter((sale) => sale.method === 'Tarjeta').reduce((sum, sale) => sum + sale.total, 0))} note="Cobros con terminal" /></div><section className="panel dashboard-panel"><PanelHeading title="Siguiente cuenta" link="Ver todas" onClick={() => setSection('accounts')} />{requests[0] ? <div className="cashier-next"><span className="table-chip">M{requests[0][0].padStart(2, '0')}</span><div><strong>Mesa {requests[0][0].padStart(2, '0')}</strong><small>{requests[0][1].method} · solicitada {shortTime(requests[0][1].requestedAt)}</small></div><strong>{money(tableTotal(data, requests[0][0]))}</strong><button className="button button-dark" onClick={() => onCollect(requests[0][0])}>Cobrar cuenta</button></div> : <EmptyState title="No hay cuentas por cobrar" description="Las cuentas solicitadas por las mesas aparecerán aquí." />}</section><button className="text-button" onClick={() => setSection('sales')}>Consultar corte de caja del turno →</button></>
+  return <><PageHeading eyebrow="PUNTO DE VENTA" title="Caja" description="Cobra las cuentas pendientes y revisa el corte de tu turno." action={<span className="live-pill"><span /> CAJA ABIERTA</span>} /><div className="stats-grid"><StatCard label="POR COBRAR" value={requests.length} note="Cuentas solicitadas" accent /><StatCard label="VENTA DE HOY" value={money(todaySales.reduce((sum, sale) => sum + sale.total, 0))} note={`${todaySales.length} cuentas pagadas`} /><StatCard label="EFECTIVO" value={money(todaySales.filter((sale) => sale.method === 'Efectivo').reduce((sum, sale) => sum + sale.total, 0))} note="Cobros en efectivo" /><StatCard label="TARJETA" value={money(todaySales.filter((sale) => sale.method === 'Tarjeta').reduce((sum, sale) => sum + sale.total, 0))} note="Cobros con terminal" /></div><section className="panel dashboard-panel"><PanelHeading title="Siguiente cuenta" link="Ver todas" onClick={() => setSection('accounts')} />{nextRequest ? <div className="cashier-next"><span className="table-chip">M{nextRequest[0].padStart(2, '0')}</span><div><strong>Mesa {nextRequest[0].padStart(2, '0')}</strong><small>{nextRequest[1].method} · solicitada {shortTime(nextRequest[1].requestedAt)}</small></div><strong>{nextTotal.label}</strong><button className="button button-dark" disabled={!nextTotal.canCollect} onClick={() => onCollect(nextRequest[0])}>Cobrar cuenta</button></div> : <EmptyState title="No hay cuentas por cobrar" description="Las cuentas solicitadas por las mesas aparecerán aquí." />}</section><button className="text-button" onClick={() => setSection('sales')}>Consultar corte de caja del turno →</button></>
 }
 
 function CashierAccounts({ data, onCollect }) {
-  const requests = Object.entries(data.accounts).filter(([, account]) => account.requested && account.attendedBy).sort((a, b) => new Date(a[1].requestedAt) - new Date(b[1].requestedAt))
-  return <><PageHeading eyebrow="PUNTO DE VENTA" title="Cuentas por cobrar" description="Revisa el detalle de cada cuenta y registra el pago recibido." action={<span className="live-pill"><span /> ACTUALIZACIÓN AUTOMÁTICA</span>} />{requests.length ? <div className="cashier-account-grid">{requests.map(([id, account]) => <article className="cashier-account-card" key={id}><div className="cashier-account-title"><span className="table-chip">M{id.padStart(2, '0')}</span><div><strong>Mesa {id.padStart(2, '0')}</strong><small>Solicitada {shortTime(account.requestedAt)}</small></div><StatusBadge status="Por cobrar" /></div><div className="cashier-item-list">{tableOrders(data, id).flatMap((order) => order.items.map((item, index) => <div key={`${order.id}-${item.productId}-${index}`}><span>{item.quantity} × {item.name}</span><span>{money(item.price * item.quantity)}</span></div>))}</div><div className="cashier-total"><span>Total de cuenta</span><strong>{money(tableTotal(data, id))}</strong></div><div className="payment-preference">Método elegido por el comensal <strong>{account.method}</strong></div><button className="button button-dark button-wide" onClick={() => onCollect(id)}>Registrar pago <span>→</span></button></article>)}</div> : <EmptyState title="No hay cuentas por cobrar" description="Las cuentas solicitadas por las mesas aparecerán aquí." />}</>
+  const requests = activeAccountRequests(data).filter(([, account]) => account.attendedBy).sort((a, b) => new Date(a[1].requestedAt) - new Date(b[1].requestedAt))
+  return <><PageHeading eyebrow="PUNTO DE VENTA" title="Cuentas por cobrar" description="Revisa el detalle de cada cuenta y registra el pago recibido." action={<span className="live-pill"><span /> ACTUALIZACIÓN AUTOMÁTICA</span>} />{requests.length ? <div className="cashier-account-grid">{requests.map(([id, account]) => { const total = getAccountTotal(data, id); return <article className="cashier-account-card" key={id}><div className="cashier-account-title"><span className="table-chip">M{id.padStart(2, '0')}</span><div><strong>Mesa {id.padStart(2, '0')}</strong><small>Solicitada {shortTime(account.requestedAt)}</small></div><StatusBadge status="Por cobrar" /></div><div className="cashier-item-list">{tableOrders(data, id).flatMap((order) => order.items.map((item, index) => <div key={`${order.id}-${item.productId}-${index}`}><span>{item.quantity} × {item.name}</span><span>{formatAccountItemTotal(item)}</span></div>))}</div><div className="cashier-total"><span>Total de cuenta</span><strong>{total.label}</strong></div><div className="payment-preference">Método elegido por el comensal <strong>{account.method}</strong></div><button className="button button-dark button-wide" disabled={!total.canCollect} onClick={() => onCollect(id)}>Registrar pago <span>→</span></button></article> })}</div> : <EmptyState title="No hay cuentas por cobrar" description="Las cuentas solicitadas por las mesas aparecerán aquí." />}</>
 }
 
-function CashierSales({ data, date, setDate, session }) {
-  const sales = data.sales.filter((sale) => sale.cashier === session.name && dateKey(sale.paidAt) === date).sort((a, b) => new Date(b.paidAt) - new Date(a.paidAt))
+function CashierSales({ data, date, setDate, session, notify }) {
+  const sales = salesForCashier(data.sales, session, date).sort((a, b) => new Date(b.paidAt) - new Date(a.paidAt))
   const cashTotal = sales.filter((sale) => sale.method === 'Efectivo').reduce((sum, sale) => sum + sale.total, 0)
   const cardTotal = sales.filter((sale) => sale.method === 'Tarjeta').reduce((sum, sale) => sum + sale.total, 0)
-  return <><PageHeading eyebrow="PUNTO DE VENTA" title="Corte de caja" description="Consulta las ventas que registraste durante el turno." action={<input className="date-control" type="date" value={date} onChange={(event) => setDate(event.target.value)} aria-label="Fecha de ventas" />} /><div className="stats-grid"><StatCard label="CUENTAS COBRADAS" value={sales.length} note={`Fecha ${date}`} accent /><StatCard label="TOTAL COBRADO" value={money(cashTotal + cardTotal)} note="Ventas registradas" /><StatCard label="EFECTIVO" value={money(cashTotal)} note="Pagos en efectivo" /><StatCard label="TARJETA" value={money(cardTotal)} note="Pagos con terminal" /></div>{sales.length ? <section className="panel"><PanelHeading title="Ventas del turno" /><div className="table-scroll"><table><thead><tr><th>HORA</th><th>MESA</th><th>CUENTA</th><th>MÉTODO</th><th>TOTAL</th></tr></thead><tbody>{sales.map((sale) => <tr key={sale.id}><td>{shortTime(sale.paidAt)}</td><td>Mesa {sale.tableName}</td><td>{sale.id}</td><td>{sale.method}</td><td className="strong-cell">{money(sale.total)}</td></tr>)}</tbody></table></div></section> : <EmptyState title="No hay ventas registradas" description="Los pagos que registres durante el turno aparecerán aquí." />}</>
+  const downloadPdf = async () => {
+    try {
+      const { generateCashierPdf } = await import('./cashierPdf')
+      generateCashierPdf({ date, cashier: session.name, sales, cashTotal, cardTotal })
+      notify('El corte de caja se descargó en PDF.')
+    } catch (error) {
+      console.error('Error generando el PDF del corte de caja:', error)
+      notify('No se pudo generar el PDF del corte de caja.', 'error')
+    }
+  }
+  return <><PageHeading eyebrow="PUNTO DE VENTA" title="Corte de caja" description="Consulta las ventas que registraste durante el turno." action={<><input className="date-control" type="date" value={date} onChange={(event) => setDate(event.target.value)} aria-label="Fecha de ventas" /><button className="button button-dark" disabled={!sales.length} onClick={downloadPdf}>Descargar PDF</button></>} /><div className="stats-grid"><StatCard label="CUENTAS COBRADAS" value={sales.length} note={`Fecha ${date}`} accent /><StatCard label="TOTAL COBRADO" value={money(cashTotal + cardTotal)} note="Ventas registradas" /><StatCard label="EFECTIVO" value={money(cashTotal)} note="Pagos en efectivo" /><StatCard label="TARJETA" value={money(cardTotal)} note="Pagos con terminal" /></div>{sales.length ? <section className="panel"><PanelHeading title="Ventas del turno" /><div className="table-scroll"><table><thead><tr><th>HORA</th><th>MESA</th><th>CUENTA</th><th>MÉTODO</th><th>TOTAL</th></tr></thead><tbody>{sales.map((sale) => <tr key={sale.id}><td>{shortTime(sale.paidAt)}</td><td>Mesa {sale.tableName}</td><td>{sale.id}</td><td>{sale.method}</td><td className="strong-cell">{money(sale.total)}</td></tr>)}</tbody></table></div></section> : <EmptyState title="No hay ventas registradas" description="Los pagos que registres durante el turno aparecerán aquí." />}</>
 }
 
 function SalesReport({ data, start, end, setStart, setEnd }) {
@@ -1072,10 +1233,10 @@ function Backups({ data, setData, changeData, notify, fileInput }) {
       return
     }
     setBackups(nextBackups)
-    const blob = new Blob([JSON.stringify({ application: 'Lumbre POS', version: 1, createdAt: backup.createdAt, data }, null, 2)], { type: 'application/json' })
+    const blob = new Blob([JSON.stringify({ application: 'SaborMX POS', version: 1, createdAt: backup.createdAt, data }, null, 2)], { type: 'application/json' })
     const link = document.createElement('a')
     link.href = URL.createObjectURL(blob)
-    link.download = `lumbre-respaldo-${todayKey()}.json`
+    link.download = `sabormx-respaldo-${todayKey()}.json`
     link.click()
     URL.revokeObjectURL(link.href)
     changeData((current) => current, 'Respaldo', 'Respaldo de datos generado correctamente.')
@@ -1088,7 +1249,7 @@ function Backups({ data, setData, changeData, notify, fileInput }) {
       const arrayFields = ['products', 'tables', 'users', 'devices', 'orders', 'sales', 'events']
       const validAccounts = replacement?.accounts && typeof replacement.accounts === 'object' && !Array.isArray(replacement.accounts)
       if (!replacement || !arrayFields.every((key) => Array.isArray(replacement[key])) || !validAccounts) {
-        throw new Error('El archivo no contiene un respaldo válido de Lumbre POS.')
+        throw new Error('El archivo no contiene un respaldo válido de SaborMX POS.')
       }
       if (!window.confirm('Restaurar este respaldo reemplazará los datos actuales. ¿Deseas continuar?')) return
       setData(withEvent(replacement, 'Respaldo', 'Administrador de red', 'Base de datos restaurada desde un respaldo.'))
@@ -1100,7 +1261,7 @@ function Backups({ data, setData, changeData, notify, fileInput }) {
       if (fileInput.current) fileInput.current.value = ''
     }
   }
-  return <><PageHeading eyebrow="ADMINISTRACIÓN TÉCNICA" title="Respaldos" description="Protege los datos del restaurante y restaura una copia cuando sea necesario." action={<button className="button button-dark" onClick={createBackup}>↓ Generar respaldo</button>} /><div className="backup-callout"><div><span className="eyebrow">COPIA DE SEGURIDAD</span><h2>Un respaldo, por si acaso.</h2><p>Descarga una copia JSON de los datos para guardarla en una ubicación segura fuera de este equipo.</p></div><button className="button button-outline" onClick={() => fileInput.current?.click()}>Restaurar respaldo</button><input ref={fileInput} type="file" accept=".json,application/json" hidden onChange={(event) => { if (event.target.files?.[0]) restore(event.target.files[0]) }} /></div><section className="panel backup-schedule-panel"><div><p className="eyebrow">RESPALDO PROGRAMADO</p><strong>Frecuencia automática</strong><small>Se crea una copia en este navegador mientras la aplicación está abierta.</small></div><select aria-label="Frecuencia de respaldos" value={schedule.enabled ? schedule.frequency : 'manual'} onChange={(event) => setSchedule((current) => ({ ...current, enabled: event.target.value !== 'manual', frequency: event.target.value === 'manual' ? current.frequency : event.target.value }))}><option value="manual">Solo manual</option><option value="diario">Diario</option><option value="semanal">Semanal</option></select></section><section className="panel"><PanelHeading title="Respaldos recientes" /><div className="backup-history">{backups.map((backup) => <div className="backup-row" key={backup.id}><span className="backup-file-icon">JSON</span><div><strong>{backup.id}</strong><small>{new Intl.DateTimeFormat('es-MX', { dateStyle: 'long', timeStyle: 'short' }).format(new Date(backup.createdAt))}</small></div><span>{(new Blob([JSON.stringify(backup.data)]).size / 1024).toFixed(1)} KB</span><button className="row-action" onClick={() => { const blob = new Blob([JSON.stringify({ application: 'Lumbre POS', version: 1, createdAt: backup.createdAt, data: backup.data }, null, 2)], { type: 'application/json' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `${backup.id}.json`; link.click(); URL.revokeObjectURL(link.href) }}>Descargar</button></div>)}{!backups.length ? <EmptyState title="Aún no hay respaldos" description="Genera un respaldo para guardar una copia de los datos." /> : null}</div></section><p className="page-footnote">Los respaldos recientes de esta vista se guardan en este navegador. Descarga y conserva tus copias en otro dispositivo.</p></>
+  return <><PageHeading eyebrow="ADMINISTRACIÓN TÉCNICA" title="Respaldos" description="Protege los datos del restaurante y restaura una copia cuando sea necesario." action={<button className="button button-dark" onClick={createBackup}>↓ Generar respaldo</button>} /><div className="backup-callout"><div><span className="eyebrow">COPIA DE SEGURIDAD</span><h2>Un respaldo, por si acaso.</h2><p>Descarga una copia JSON de los datos para guardarla en una ubicación segura fuera de este equipo.</p></div><button className="button button-outline" onClick={() => fileInput.current?.click()}>Restaurar respaldo</button><input ref={fileInput} type="file" accept=".json,application/json" hidden onChange={(event) => { if (event.target.files?.[0]) restore(event.target.files[0]) }} /></div><section className="panel backup-schedule-panel"><div><p className="eyebrow">RESPALDO PROGRAMADO</p><strong>Frecuencia automática</strong><small>Se crea una copia en este navegador mientras la aplicación está abierta.</small></div><select aria-label="Frecuencia de respaldos" value={schedule.enabled ? schedule.frequency : 'manual'} onChange={(event) => setSchedule((current) => ({ ...current, enabled: event.target.value !== 'manual', frequency: event.target.value === 'manual' ? current.frequency : event.target.value }))}><option value="manual">Solo manual</option><option value="diario">Diario</option><option value="semanal">Semanal</option></select></section><section className="panel"><PanelHeading title="Respaldos recientes" /><div className="backup-history">{backups.map((backup) => <div className="backup-row" key={backup.id}><span className="backup-file-icon">JSON</span><div><strong>{backup.id}</strong><small>{new Intl.DateTimeFormat('es-MX', { dateStyle: 'long', timeStyle: 'short' }).format(new Date(backup.createdAt))}</small></div><span>{(new Blob([JSON.stringify(backup.data)]).size / 1024).toFixed(1)} KB</span><button className="row-action" onClick={() => { const blob = new Blob([JSON.stringify({ application: 'SaborMX POS', version: 1, createdAt: backup.createdAt, data: backup.data }, null, 2)], { type: 'application/json' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `${backup.id}.json`; link.click(); URL.revokeObjectURL(link.href) }}>Descargar</button></div>)}{!backups.length ? <EmptyState title="Aún no hay respaldos" description="Genera un respaldo para guardar una copia de los datos." /> : null}</div></section><p className="page-footnote">Los respaldos recientes de esta vista se guardan en este navegador. Descarga y conserva tus copias en otro dispositivo.</p></>
 }
 
 function EventLog({ data, logType, setLogType }) {
@@ -1202,16 +1363,17 @@ async function saveUser(user, data, changeData, notify, setModal, reloadUsers) {
 }
 
 function PaymentModal({ data, tableId, method, setMethod, received, setReceived, onClose, onConfirm }) {
-  const total = tableTotal(data, tableId)
+  const { total, canCollect, label } = getAccountTotal(data, tableId)
   const numericReceived = Number(received)
-  const change = method === 'Efectivo' && numericReceived >= total ? numericReceived - total : 0
-  return <div className="modal-backdrop" onClick={onClose}><div className="modal payment-modal" onClick={(event) => event.stopPropagation()}><button className="modal-close" onClick={onClose} aria-label="Cerrar">×</button><p className="eyebrow">COBRO DE CUENTA · MESA {tableId.padStart(2, '0')}</p><h2>Registrar pago</h2><div className="payment-modal-total"><span>Total a cobrar</span><strong>{money(total)}</strong></div><label className="form-field">Método de pago<select value={method} onChange={(event) => setMethod(event.target.value)}><option>Efectivo</option><option>Tarjeta</option></select></label>{method === 'Efectivo' ? <><label className="form-field">Monto recibido<input type="number" min={total} step="0.01" value={received} onChange={(event) => setReceived(event.target.value)} placeholder="0.00" /></label><div className="change-amount"><span>Cambio</span><strong>{money(change)}</strong></div></> : <p className="page-footnote">Procesa el cobro en la terminal del restaurante. No se almacenan datos de tarjeta.</p>}<div className="modal-actions"><button className="button button-outline" onClick={onClose}>Cancelar</button><button className="button button-dark" onClick={onConfirm}>Confirmar pago</button></div></div></div>
+  const change = canCollect && method === 'Efectivo' && numericReceived >= total ? numericReceived - total : 0
+  return <div className="modal-backdrop" onClick={onClose}><div className="modal payment-modal" onClick={(event) => event.stopPropagation()}><button className="modal-close" onClick={onClose} aria-label="Cerrar">×</button><p className="eyebrow">COBRO DE CUENTA · MESA {tableId.padStart(2, '0')}</p><h2>Registrar pago</h2><div className="payment-modal-total"><span>Total a cobrar</span><strong>{label}</strong></div><label className="form-field">Método de pago<select value={method} onChange={(event) => setMethod(event.target.value)}><option>Efectivo</option><option>Tarjeta</option></select></label>{method === 'Efectivo' ? <><label className="form-field">Monto recibido<input type="number" min={canCollect ? total : undefined} step="0.01" value={received} onChange={(event) => setReceived(event.target.value)} placeholder="0.00" /></label><div className="change-amount"><span>Cambio</span><strong>{money(change)}</strong></div></> : <p className="page-footnote">Procesa el cobro en la terminal del restaurante. No se almacenan datos de tarjeta.</p>}<div className="modal-actions"><button className="button button-outline" onClick={onClose}>Cancelar</button><button className="button button-dark" disabled={!canCollect} onClick={onConfirm}>Confirmar pago</button></div></div></div>
 }
 
 async function confirmPayment(tableId, method, received, session, data, changeData, notify, setPayment) {
   const total = tableTotal(data, tableId)
-  if (method === 'Efectivo' && Number(received) < total) { notify('El monto recibido es menor al total.', 'error'); return }
   if (!tableOrders(data, tableId).length) { notify('No hay una cuenta pendiente para esta mesa.', 'error'); setPayment(null); return }
+  if (!Number.isFinite(total) || total <= 0) { notify('El importe de la cuenta no es válido y no se puede cobrar.', 'error'); return }
+  if (method === 'Efectivo' && Number(received) < total) { notify('El monto recibido es menor al total.', 'error'); return }
   const paymentId = `VTA-${Date.now().toString().slice(-6)}`
   const paidAt = new Date().toISOString()
   const paidOrders = tableOrders(data, tableId)
@@ -1223,6 +1385,7 @@ async function confirmPayment(tableId, method, received, session, data, changeDa
     method,
     paidAt,
     cashier: session?.name || 'Caja',
+    cashierId: String(session?.id ?? ''),
     items: paidOrders.flatMap((order) => order.items),
   }
   try {

@@ -1,4 +1,4 @@
-# Lumbre POS
+# Cadena de Restaurantes SaborMX (Grupo Restaurantero SaborMX S.A. de C.V.)
 
 Aplicación web en español para el menú digital y la operación diaria de un
 restaurante. Incluye vistas para comensales, gerencia, cocina/barra, servicio,
@@ -43,8 +43,8 @@ parte superior para enviar pedidos y consultar su cuenta.
 - Cocina y barra reciben sus propias comandas, actualizan su preparación y
   marcan los pedidos listos.
 - Servicio ve las mesas, confirma entregas y atiende solicitudes de cuenta.
-- Caja cobra en efectivo o tarjeta, calcula el cambio y consulta el corte del
-  turno.
+- Caja cobra en efectivo o tarjeta, calcula el cambio, consulta el corte del
+  turno y descarga sus registros por fecha en PDF.
 - Gerencia administra productos, mesas y personal, y consulta pedidos y
   reportes de ventas.
 - Administración de red monitorea dispositivos, registra equipos, consulta la
